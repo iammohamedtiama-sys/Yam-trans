@@ -1,0 +1,20 @@
+{
+  "name": "transfert-pos",
+  "version": "4.6.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "android:add": "npx cap add android",
+    "android:sync": "npx cap sync android"
+  },
+  "dependencies": {
+    "@capacitor/android": "8.4.2",
+    "@capacitor/cli": "8.4.2",
+    "@capacitor/core": "8.4.2",
+    "jspdf": "4.2.1",
+    "qrcode": "1.5.4",
+    "vite": "8.1.5"
+  }
+}
