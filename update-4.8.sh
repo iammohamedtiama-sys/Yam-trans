@@ -24,8 +24,8 @@ docker compose exec -T api python -c 'import json,time,urllib.request
 for attempt in range(30):
  try:
   data=json.load(urllib.request.urlopen("http://127.0.0.1:8000/health",timeout=3))
-  assert data.get("version")=="4.8.0", "Version inattendue"
-  print("YamTrans 4.8.0 : serveur opérationnel")
+  assert data.get("version")=="4.8.1", "Version inattendue"
+  print("YamTrans 4.8.1 : serveur opérationnel")
   break
  except Exception:
   if attempt==29: raise SystemExit("Vérification du serveur échouée. La sauvegarde PostgreSQL a été conservée.")

@@ -109,7 +109,7 @@ with engine.begin() as conn:
     except Exception:
         try: conn.execute(text("ALTER TABLE app_users_v3 ADD COLUMN modules JSON"))
         except Exception: pass
-app = FastAPI(title="YAM TRANS Multi-Sociétés · Courrier & Billetterie", version="4.8.0")
+app = FastAPI(title="YAM TRANS Multi-Sociétés · Courrier & Billetterie", version="4.8.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -389,6 +389,19 @@ def require_company(token: dict[str, Any], db: Session) -> Company:
     company = db.get(Company, cid)
     if not company or not company.active:
         raise HTTPException(403, "Société inactive ou introuvable")
+    # Account edits and deactivation apply to sessions already open on other devices.
+    uid = str(token.get("uid") or "")
+    if uid.startswith('platform:'):
+        actor_id, _, target = uid[len('platform:'):].rpartition(':')
+        actor = db.get(AppUser, actor_id)
+        if target != cid or not actor or not actor.active or actor.role != 'platform_admin':
+            raise HTTPException(401, "Accès plateforme révoqué")
+        token['role'], token['agency'] = 'company_admin', 'Toutes'
+    else:
+        actor = db.get(AppUser, uid)
+        if not actor or not actor.active or actor.company_id != cid:
+            raise HTTPException(401, "Compte inactif ou session révoquée")
+        token['role'], token['agency'] = actor.role, actor.agency
     return company
 
 
@@ -535,7 +548,7 @@ def agency_public_info(db: Session, company_id: str, name: str) -> dict[str, str
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "transport-multitenant-sync", "version": "4.8.0", "time": utcnow().isoformat()}
+    return {"status": "ok", "service": "transport-multitenant-sync", "version": "4.8.1", "time": utcnow().isoformat()}
 
 
 @app.post("/api/v2/auth/login")
@@ -1497,7 +1510,7 @@ def tracking_page(company: str = Query(default=DEFAULT_COMPANY_CODE), code: str 
 
 @app.get("/")
 def root():
-    return {"service": "Transport Multi-Sociétés", "version": "4.8.0", "health": f"{PUBLIC_BASE_URL}/health", "tracking": f"{PUBLIC_BASE_URL}/suivi?company={DEFAULT_COMPANY_CODE}&code=OUA-00001"}
+    return {"service": "Transport Multi-Sociétés", "version": "4.8.1", "health": f"{PUBLIC_BASE_URL}/health", "tracking": f"{PUBLIC_BASE_URL}/suivi?company={DEFAULT_COMPANY_CODE}&code=OUA-00001"}
 
 
 # Interface web complète : le même client que l'application Android, avec les mêmes rôles.

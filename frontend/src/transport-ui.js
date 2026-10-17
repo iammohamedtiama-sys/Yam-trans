@@ -169,15 +169,16 @@ export function createTransportUi(ctx) {
     try {await synced();hold=await api('/holds',{tripId,seat,boardingPoint,dropPoint,deviceId:ctx.deviceId(),holdId:hold?.id||''});notify('Siège bloqué pendant 5 minutes sur les guichets connectés.','success');}
     finally {holding=false;}
   }
-  async function confirmTicket(ticket) {
-    if(!navigator.onLine){if(ticket.packId)throw new Error('Un carnet prépayé nécessite une connexion pour éviter deux débits concurrents');return {...ticket,status:'À synchroniser',confirmationSource:'offline'}};
+  async function confirmTicket(ticket,document=null) {
+    if(!navigator.onLine){if(document)throw new Error('La sauvegarde de la pièce et du billet nécessite une connexion');if(ticket.packId)throw new Error('Un carnet prépayé nécessite une connexion pour éviter deux débits concurrents');return {...ticket,status:'À synchroniser',confirmationSource:'offline'}};
     if(holding)throw new Error('Attendez la confirmation du blocage du siège');
-    const data=await api('/tickets/confirm',{ticket,holdId:hold?.id||''});hold=null;
+    const data=await api('/tickets/confirm',{ticket,document,holdId:hold?.id||''});hold=null;
+    if(data.customer)replace('ticketCustomers',data.customer);
     return data.ticket;
   }
   function releaseHold() {
     const old=hold;hold=null;
     if(old&&navigator.onLine)api('/holds/'+old.id,undefined,'DELETE').catch(()=>{});
   }
-  return {panel,bind,recoverTicket:async id=>(await api('/tickets/'+encodeURIComponent(id),undefined,'GET')).ticket,confirmTicket,selectSeat,releaseHold,enhanceTicket};
+  return {panel,bind,boardTicket:async(id,tripId,documentNumber='')=>api('/tickets/'+encodeURIComponent(id)+'/board',{tripId,documentNumber}),recoverTicket:async id=>(await api('/tickets/'+encodeURIComponent(id),undefined,'GET')).ticket,confirmTicket,selectSeat,releaseHold,enhanceTicket};
 }

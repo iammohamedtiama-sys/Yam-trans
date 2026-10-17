@@ -106,6 +106,7 @@ class SeatRequest(BaseModel):
 
 class ConfirmRequest(BaseModel):
     ticket: dict
+    document: dict | None = None
     holdId: str = ""
     reservationId: str = ""
 
@@ -118,6 +119,11 @@ class BatchRequest(BaseModel):
 class RefundRequest(BaseModel):
     amount: float = Field(ge=0, allow_inf_nan=False)
     reason: str = Field(min_length=3, max_length=500)
+
+
+class BoardingRequest(BaseModel):
+    tripId: str = Field(min_length=1, max_length=120)
+    documentNumber: str = Field(default='', max_length=100)
 
 
 class WaitRequest(BaseModel):
@@ -410,6 +416,48 @@ def install(app, env):
         seat=next(s for s in bus_seats(bus) if str(s.get("label"))==str(t["seat"]))
         t["seatClass"]=seat.get("class") or "Simple"
         t["busLabel"]=f'{bus.get("name","")} {bus.get("registration","")}'.strip()
+        # Register the private document in the same transaction as the paid ticket.
+        # Never copy the photograph into tickets, sync payloads or public views.
+        t.pop("documentPhoto", None)
+        t.pop("photo", None)
+        if req.document is not None:
+            from .operations import DocumentRequest
+            from pydantic import ValidationError
+            try:
+                doc_req=DocumentRequest.model_validate({**req.document,"id":"sale-document-"+str(t["id"]),"customerName":t["passengerName"],"phone":t["phone"]})
+            except ValidationError:
+                raise HTTPException(422,"Informations de la pièce incomplètes ou invalides")
+            number="".join(doc_req.number.upper().split())
+            if number!="".join(str(t.get("documentNumber") or "").upper().split()):
+                raise HTTPException(422,"Le numéro confirmé doit correspondre à la pièce du billet")
+            if doc_req.expiresOn:
+                try: expired=datetime.strptime(doc_req.expiresOn,"%Y-%m-%d").date()<now().date()
+                except ValueError: raise HTTPException(422,"Date d’expiration invalide")
+                if expired: raise HTTPException(422,"Pièce expirée : renouvellement requis")
+            if doc_req.photo:
+                from .identity_ocr import decode_image
+                decode_image(doc_req.photo)
+            same_name=lambda a,b:" ".join(str(a).casefold().split())==" ".join(str(b).casefold().split())
+            same_phone=lambda a,b:"".join(x for x in str(a) if x.isdigit())=="".join(x for x in str(b) if x.isdigit())
+            registered=next((d for d in rows(db,c.id,"customer_documents") if d.get("active") and d.get("number")==number),None)
+            if registered:
+                if not same_name(registered.get("customerName"),t["passengerName"]) or not same_phone(registered.get("phone"),t["phone"]):
+                    raise HTTPException(409,"Cette pièce appartient à un autre profil : contrôlez le nom et le téléphone dans Identité client")
+                if registered.get("expiresOn") and registered["expiresOn"]<now().date().isoformat():
+                    raise HTTPException(409,"Pièce expirée : renouvellement requis")
+                customer_id=registered["customerId"]
+                if doc_req.photo:
+                    put(db,c.id,"customer_documents",{**registered,"photo":doc_req.photo})
+            else:
+                customer=next((cst for cst in rows(db,c.id,"ticket_customers") if same_phone(cst.get("phone"),t["phone"]) and same_name(cst.get("name"),t["passengerName"])),None)
+                customer_id=customer["id"] if customer else str(uuid.uuid4())
+                if not customer: put(db,c.id,"ticket_customers",{"id":customer_id,"name":t["passengerName"],"phone":t["phone"],"points":0})
+                put(db,c.id,"customer_documents",{**doc_req.model_dump(),"customerId":customer_id,"number":number,"active":True,"createdBy":u.id,"createdAt":now().isoformat()})
+            if t.get("customerId") and t["customerId"]!=customer_id:
+                raise HTTPException(422,"La pièce et le carnet ne correspondent pas au même client")
+            t["customerId"]=customer_id
+            t["documentNumber"]=number
+            audit(db,c,u,"Pièce contrôlée à la vente",str(t["id"]))
         pack = None
         if t.get("packId"):
             pack=get(db,c.id,"travel_packs",str(t["packId"]))
@@ -451,8 +499,42 @@ def install(app, env):
     def confirm(req: ConfirmRequest, token=Depends(auth), db=Depends(session)):
         c,u=access(db,token,"sales",True)
         result=issue_ticket(req,c,u,db)
+        customer_id=result['ticket'].get('customerId')
+        if customer_id:
+            result['customer']=next((p for p in rows(db,c.id,'ticket_customers') if p['id']==customer_id),None)
         db.commit()
         return result
+
+    @app.post("/api/v2/transport/tickets/{ticket_id}/board")
+    def board_ticket(ticket_id: str, req: BoardingRequest, token=Depends(auth), db=Depends(session)):
+        c,u=access(db,token,"boarding",True)
+        t=get(db,c.id,"tickets",ticket_id)
+        if t.get("tripId")!=req.tripId:
+            raise HTTPException(409,"Mauvais départ : faites transférer le billet par un responsable")
+        if not active(t): raise HTTPException(409,"Billet annulé ou remboursé")
+        trip=get(db,c.id,"ticket_trips",req.tripId)
+        try: departure=datetime.fromisoformat(str(trip.get("departureAt") or '').replace('Z','+00:00'))
+        except ValueError: raise HTTPException(422,"Date du départ invalide")
+        if departure.date()!=now().date():
+            raise HTTPException(409,"Ce billet concerne un autre jour : transfert requis")
+        if trip.get("status") in {"Annulé","Terminé","Clôturé","Arrivé"}:
+            raise HTTPException(409,"Embarquement fermé pour ce départ")
+        if req.documentNumber:
+            number="".join(req.documentNumber.upper().split())
+            doc=next((d for d in rows(db,c.id,"customer_documents") if d.get("active") and d.get("number")==number),None)
+            if not doc or (t.get("customerId")!=doc.get("customerId") and "".join(str(t.get("documentNumber") or "").upper().split())!=number):
+                raise HTTPException(403,"Cette pièce ne correspond pas au billet")
+            if doc.get("expiresOn") and doc["expiresOn"]<now().date().isoformat():
+                raise HTTPException(409,"Pièce expirée : renouvellement requis")
+        if t.get("boarded"):
+            db.commit();return {"ticket":t,"alreadyBoarded":True}
+        if float(t.get("balance") or 0)>0:
+            raise HTTPException(409,"Le solde du billet doit être réglé avant embarquement")
+        stamp=now().isoformat()
+        t=put(db,c.id,"tickets",{**t,"boarded":True,"boardedAt":stamp,"boardedBy":u.id,"noShow":False})
+        boarding=put(db,c.id,"ticket_boardings",{"id":"boarding-"+ticket_id,"ticketId":ticket_id,"pnr":t.get("pnr"),"tripId":req.tripId,"agency":u.agency,"createdBy":u.id,"createdAt":stamp,"method":"document" if req.documentNumber else "ticket"})
+        audit(db,c,u,"Embarquement confirmé",str(t.get("pnr") or ticket_id));db.commit()
+        return {"ticket":t,"boarding":boarding,"alreadyBoarded":False}
 
     @app.post("/api/v2/transport/bookings/confirm")
     def confirm_batch(req: BatchRequest, token=Depends(auth), db=Depends(session)):
