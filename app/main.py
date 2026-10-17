@@ -19,6 +19,7 @@ from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import Boolean, DateTime, Integer, JSON, String, Text, UniqueConstraint, create_engine, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
+from .transport import install as install_transport, lock_company, READ_ONLY_TYPES, active as transport_active
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./yamtrans-sync.db")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000").rstrip("/")
@@ -107,7 +108,7 @@ with engine.begin() as conn:
     except Exception:
         try: conn.execute(text("ALTER TABLE app_users_v3 ADD COLUMN modules JSON"))
         except Exception: pass
-app = FastAPI(title="YAM TRANS Multi-Sociétés · Courrier & Billetterie", version="4.6.3")
+app = FastAPI(title="YAM TRANS Multi-Sociétés · Courrier & Billetterie", version="4.7.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -120,7 +121,7 @@ ALLOWED_TYPES = {
     "shipments", "customers", "manifests", "withdrawals", "expenses", "payments",
     "agencies", "routes", "stations", "vehicles", "schedules", "audit",
     "tickets", "ticket_buses", "ticket_routes", "ticket_trips", "ticket_boardings",
-    "ticket_customers", "ticket_promos", "ticket_refunds", "ticket_reservations", "ticket_baggage", "loyalty_transactions", "notification_logs",
+    "ticket_holds", "ticket_waitlist", "ticket_closures", "ticket_customers", "ticket_promos", "ticket_refunds", "ticket_reservations", "ticket_baggage", "loyalty_transactions", "notification_logs",
 }
 GLOBAL_TYPES = {"agencies", "routes", "stations", "vehicles", "schedules", "ticket_buses", "ticket_routes", "ticket_trips", "ticket_promos"}
 
@@ -533,7 +534,7 @@ def agency_public_info(db: Session, company_id: str, name: str) -> dict[str, str
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "transport-multitenant-sync", "version": "4.6.3", "time": utcnow().isoformat()}
+    return {"status": "ok", "service": "transport-multitenant-sync", "version": "4.7.0", "time": utcnow().isoformat()}
 
 
 @app.post("/api/v2/auth/login")
@@ -685,6 +686,7 @@ def shipment_destination_allowed(db: Session, company_id: str, payload: dict[str
 
 @app.post("/api/v2/sync")
 def sync_v2(req: SyncRequest, token: dict[str, Any] = Depends(read_token), db: Session = Depends(db_session)):
+    lock_company(db, Company, token.get("cid"))
     company = require_company(token, db)
     conflicts: list[dict[str, Any]] = []
     rejected_duplicate_ids: list[str] = []
@@ -692,9 +694,10 @@ def sync_v2(req: SyncRequest, token: dict[str, Any] = Depends(read_token), db: S
     # Les agences passent d'abord afin qu'une modification de destinations autorisées
     # soit appliquée dans la même synchronisation avant les nouveaux envois.
     ordered_entities = list(req.entities.items())
-    ordered_entities.sort(key=lambda kv: 0 if kv[0] == "agencies" else 1)
+    priority = {"agencies":0,"ticket_buses":1,"ticket_routes":2,"ticket_trips":3,"ticket_reservations":4,"tickets":5}
+    ordered_entities.sort(key=lambda kv: priority.get(kv[0],6))
     for entity_type, items in ordered_entities:
-        if entity_type not in ALLOWED_TYPES:
+        if entity_type not in ALLOWED_TYPES or entity_type in READ_ONLY_TYPES:
             continue
         for incoming in items:
             payload = dict(incoming)
@@ -738,6 +741,31 @@ def sync_v2(req: SyncRequest, token: dict[str, Any] = Depends(read_token), db: S
                         "message": "Destination non autorisée pour cette agence",
                     })
                     continue
+
+            if entity_type == "tickets" and current is not None:
+                previous = dict(current.payload or {})
+                if previous.get("refundId") and any(payload.get(k) != previous.get(k) for k in ("status", "refundId", "refundedAmount", "paid", "fare")):
+                    conflicts.append({"type":"refund_protected", "entityType":entity_type, "id":entity_id, "message":"Un remboursement validé ne peut pas être modifié par synchronisation"})
+                    continue
+            if entity_type == "tickets" and payload.get("confirmationSource") == "offline" and payload.get("status") == "À synchroniser":
+                payload["status"] = "Confirmé"
+                payload["confirmationSource"] = "server"
+
+            # Validate only a new/moved allocation. Boarding an existing ticket after
+            # departure must remain possible and must not re-run sale-time checks.
+            if entity_type in {"tickets", "ticket_reservations"} and transport_active(payload):
+                previous = dict(current.payload or {}) if current is not None else {}
+                keys = ("tripId", "seat", "boardingPoint", "dropPoint")
+                moved = current is None or not transport_active(previous) or any(str(previous.get(k) or "") != str(payload.get(k) or "") for k in keys)
+                if moved:
+                    try:
+                        validate_transport_seat(db, company.id, payload,
+                            exclude_id=entity_id if entity_type == "tickets" else "",
+                            reservation_id=entity_id if entity_type == "ticket_reservations" else "")
+                    except (HTTPException, KeyError) as exc:
+                        conflicts.append({"type":"seat_conflict", "entityType":entity_type, "id":entity_id,
+                            "message":str(exc.detail) if isinstance(exc, HTTPException) else "Voyage et siège requis"})
+                        continue
 
             if current is None:
                 duplicate = find_recent_duplicate(db, company.id, entity_type, payload, req.deviceId)
@@ -841,6 +869,15 @@ def _baggage_amount(payload: dict[str, Any]) -> float:
     return 0.0 if _cancelled(payload) else _num(payload.get("paid") if payload.get("paid") is not None else payload.get("amount"))
 
 
+def _ticket_amount(payload: dict[str, Any]) -> float:
+    if _cancelled(payload) or payload.get("deleted"):
+        return 0.0
+    paid = _num(payload.get("paid") if payload.get("paid") is not None else payload.get("amount"))
+    if payload.get("status") == "Remboursé":
+        return max(0.0, paid - _num(payload.get("refundedAmount") if payload.get("refundedAmount") is not None else paid))
+    return paid
+
+
 def company_stats(db: Session, company: Company) -> dict[str, Any]:
     rows = db.scalars(select(EntityV3).where(EntityV3.company_id == company.id, EntityV3.deleted.is_(False))).all()
     by_type: dict[str, list[dict[str, Any]]] = {}
@@ -878,7 +915,7 @@ def company_stats(db: Session, company: Company) -> dict[str, Any]:
         "expenses": round(expense_total, 2), "net": round(courier_sales + baggage_sales - expense_total, 2),
         "averageTicket": round(courier_sales / len(active_shipments), 2) if active_shipments else 0,
         "baggage": len(baggage), "cancelledBaggage": len(baggage)-len(active_baggage), "baggageRevenue": round(baggage_sales,2),
-        "tickets": len(tickets), "ticketRevenue": round(sum(_num(x.get("paid") or x.get("amount")) for x in tickets if not _cancelled(x)),2),
+        "tickets": len(tickets), "ticketRevenue": round(sum(_ticket_amount(x) for x in tickets),2),
         "boarded": sum(1 for x in tickets if bool(x.get("boarded"))) or len(boardings),
         "smsSent": sum(1 for x in notification_logs if x.get("channel")=="sms" and x.get("status")=="sent"),
         "whatsappSent": sum(1 for x in notification_logs if x.get("channel")=="whatsapp" and x.get("status")=="sent"),
@@ -1394,13 +1431,17 @@ def tracking_page(company: str = Query(default=DEFAULT_COMPANY_CODE), code: str 
 
 @app.get("/")
 def root():
-    return {"service": "Transport Multi-Sociétés", "version": "4.6.3", "health": f"{PUBLIC_BASE_URL}/health", "tracking": f"{PUBLIC_BASE_URL}/suivi?company={DEFAULT_COMPANY_CODE}&code=OUA-00001"}
+    return {"service": "Transport Multi-Sociétés", "version": "4.7.0", "health": f"{PUBLIC_BASE_URL}/health", "tracking": f"{PUBLIC_BASE_URL}/suivi?company={DEFAULT_COMPANY_CODE}&code=OUA-00001"}
 
 
 # Interface web complète : le même client que l'application Android, avec les mêmes rôles.
 # Les fichiers sont construits dans /webapp au moment du packaging de la release.
 WEBAPP_DIR=os.getenv("WEBAPP_DIR", "/app/webapp")
 if os.path.isdir(WEBAPP_DIR):
+    @app.get("/yamtrans-logo.jpg", include_in_schema=False)
+    def web_default_logo():
+        return FileResponse(os.path.join(WEBAPP_DIR, "yamtrans-logo.jpg"))
+
     _assets_dir=os.path.join(WEBAPP_DIR, "assets")
     if os.path.isdir(_assets_dir):
         app.mount("/app/assets", StaticFiles(directory=_assets_dir), name="yamtrans-web-assets")
@@ -1418,3 +1459,7 @@ if os.path.isdir(WEBAPP_DIR):
         if candidate.startswith(root + os.sep) and os.path.isfile(candidate):
             return FileResponse(candidate)
         return FileResponse(os.path.join(WEBAPP_DIR, "index.html"))
+
+
+# Additive transport APIs; existing entities and routes remain available.
+install_transport(app, globals())
