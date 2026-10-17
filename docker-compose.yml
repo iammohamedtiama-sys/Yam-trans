@@ -32,6 +32,9 @@ services:
       PLATFORM_ADMIN_USER: ${PLATFORM_ADMIN_USER:-platform}
       PLATFORM_ADMIN_PASSWORD: ${PLATFORM_ADMIN_PASSWORD:-ChangeMe-Platform-Admin!}
       CORS_ORIGINS: ${CORS_ORIGINS:-*}
+      YAMTRANS_AI_API_KEY: ${YAMTRANS_AI_API_KEY:-}
+      YAMTRANS_AI_MODEL: ${YAMTRANS_AI_MODEL:-}
+      YAMTRANS_AI_ENDPOINT: ${YAMTRANS_AI_ENDPOINT:-https://api.openai.com/v1/chat/completions}
     ports:
       - "127.0.0.1:${API_PORT:-8091}:8000"
 volumes:
