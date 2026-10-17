@@ -19,6 +19,7 @@ from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import Boolean, DateTime, Integer, JSON, String, Text, UniqueConstraint, create_engine, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
+from .operations import install as install_operations
 from .transport import install as install_transport, lock_company, READ_ONLY_TYPES, active as transport_active
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./yamtrans-sync.db")
@@ -108,7 +109,7 @@ with engine.begin() as conn:
     except Exception:
         try: conn.execute(text("ALTER TABLE app_users_v3 ADD COLUMN modules JSON"))
         except Exception: pass
-app = FastAPI(title="YAM TRANS Multi-Sociétés · Courrier & Billetterie", version="4.7.0")
+app = FastAPI(title="YAM TRANS Multi-Sociétés · Courrier & Billetterie", version="4.8.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -534,7 +535,7 @@ def agency_public_info(db: Session, company_id: str, name: str) -> dict[str, str
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "transport-multitenant-sync", "version": "4.7.0", "time": utcnow().isoformat()}
+    return {"status": "ok", "service": "transport-multitenant-sync", "version": "4.8.0", "time": utcnow().isoformat()}
 
 
 @app.post("/api/v2/auth/login")
@@ -619,6 +620,15 @@ def operation_duplicate_fingerprint(entity_type: str, payload: dict[str, Any]) -
 def find_recent_duplicate(db: Session, company_id: str, entity_type: str, payload: dict[str, Any], device_id: str) -> Optional[EntityV3]:
     if entity_type not in DUPLICATE_OPERATION_TYPES or bool(payload.get("deleted")):
         return None
+    operation_id = str(payload.get("clientOperationId") or "").strip()
+    if operation_id:
+        candidates = db.scalars(select(EntityV3).where(EntityV3.company_id == company_id, EntityV3.entity_type == entity_type, EntityV3.deleted.is_(False))).all()
+        for row in candidates:
+            other = row.payload or {}
+            if other.get("clientOperationId") == operation_id and str(other.get("createdBy") or "") == str(payload.get("createdBy") or ""):
+                if operation_duplicate_fingerprint(entity_type, other) != operation_duplicate_fingerprint(entity_type, payload):
+                    raise HTTPException(409, "Cette clé d’opération a déjà été utilisée avec un contenu différent")
+                return row
     created = _payload_datetime(payload.get("createdAt"))
     if not created:
         return None
@@ -690,11 +700,26 @@ def sync_v2(req: SyncRequest, token: dict[str, Any] = Depends(read_token), db: S
     company = require_company(token, db)
     conflicts: list[dict[str, Any]] = []
     rejected_duplicate_ids: list[str] = []
+    duplicate_map: dict[str, str] = {}
+    # Keep aliases across retries, including payments sent in a later sync.
+    aliases = db.scalars(select(EntityV3).where(EntityV3.company_id == company.id, EntityV3.entity_type == "operation_aliases")).all()
+    known_aliases = {(r.payload["entityType"], r.payload["sourceId"]): r.payload["targetId"] for r in aliases}
+
+    def reject_alias(kind, source, target):
+        duplicate_map[source] = target
+        rejected_duplicate_ids.append(source)
+        conflicts.append({"type":"duplicate_operation", "entityType":kind, "id":source, "duplicateOf":target, "message":"Opération déjà enregistrée; original conservé"})
+        if (kind, source) not in known_aliases:
+            ident = hashlib.sha256((kind+":"+source).encode()).hexdigest()
+            db.add(EntityV3(company_id=company.id, entity_type="operation_aliases", entity_id=ident,
+                payload={"entityType":kind,"sourceId":source,"targetId":target}, version=1, updated_at=utcnow(), deleted=False))
+            known_aliases[kind, source] = target
+            db.flush()
     accepted = 0
     # Les agences passent d'abord afin qu'une modification de destinations autorisées
     # soit appliquée dans la même synchronisation avant les nouveaux envois.
     ordered_entities = list(req.entities.items())
-    priority = {"agencies":0,"ticket_buses":1,"ticket_routes":2,"ticket_trips":3,"ticket_reservations":4,"tickets":5}
+    priority = {"agencies":0,"ticket_buses":1,"ticket_routes":2,"ticket_trips":3,"ticket_reservations":4,"tickets":5,"payments":9,"withdrawals":9,"loyalty_transactions":9}
     ordered_entities.sort(key=lambda kv: priority.get(kv[0],6))
     for entity_type, items in ordered_entities:
         if entity_type not in ALLOWED_TYPES or entity_type in READ_ONLY_TYPES:
@@ -709,6 +734,15 @@ def sync_v2(req: SyncRequest, token: dict[str, Any] = Depends(read_token), db: S
                 payload["_deviceId"] = req.deviceId
             current = db.get(EntityV3, {"company_id": company.id, "entity_type": entity_type, "entity_id": entity_id})
             incoming_version = int(payload.get("_serverVersion") or 0)
+
+            alias = known_aliases.get((entity_type, entity_id))
+            if alias:
+                reject_alias(entity_type, entity_id, alias)
+                continue
+            if entity_type in {"payments", "withdrawals"} and ("shipments", str(payload.get("shipmentId") or "")) in known_aliases:
+                # A payment of a rejected retry must never become a second cash entry.
+                reject_alias(entity_type, entity_id, known_aliases["shipments", str(payload["shipmentId"])])
+                continue
 
             # Courrier et Bagages ne peuvent pas être annulés/supprimés via la synchronisation
             # d'un compte société. L'annulation administrative passe exclusivement par
@@ -742,8 +776,44 @@ def sync_v2(req: SyncRequest, token: dict[str, Any] = Depends(read_token), db: S
                     })
                     continue
 
+            if entity_type == "ticket_trips" and ("driverId" in payload or "conductorId" in payload):
+                try:
+                    validate_crew(db, company.id, payload)
+                    payload["driver"] = db.get(AppUser, payload["driverId"]).name
+                    payload["conductor"] = db.get(AppUser, payload["conductorId"]).name if payload.get("conductorId") else ""
+                except HTTPException as exc:
+                    conflicts.append({"type":"crew_invalid","entityType":entity_type,"id":entity_id,"message":str(exc.detail)})
+                    continue
+            if entity_type == "tickets" and payload.get("packId") and current is None:
+                conflicts.append({"type":"prepaid_online_required","entityType":entity_type,"id":entity_id,"message":"Un carnet doit être débité par la confirmation serveur"})
+                continue
+
+            if entity_type == "ticket_routes":
+                tariff_keys = ("fareSimple", "fareVip", "fareChildSimple", "fareChildVip", "segmentFares")
+                previous_route = dict(current.payload or {}) if current else {}
+                tariff_changed = any(payload.get(k) != previous_route.get(k) for k in tariff_keys)
+                if tariff_changed:
+                    user = db.get(AppUser, token.get("uid"))
+                    if not user or (user.role not in {"company_admin","superuser","admin"} and "manager" not in (user.modules or {}).get("ticketRoles", [])):
+                        conflicts.append({"type":"tariff_protected","entityType":entity_type,"id":entity_id,"message":"Gestion des tarifs réservée au responsable"})
+                        continue
+
+            if entity_type == "ticket_reservations" and transport_active(payload) and (current is None or payload.get("amount")!=(current.payload or {}).get("amount")):
+                try:
+                    validate_transport_tariff(db,company.id,{**payload,"fare":payload.get("amount"),"discount":0},False)
+                except HTTPException as exc:
+                    conflicts.append({"type":"reservation_tariff","entityType":entity_type,"id":entity_id,"message":str(exc.detail)})
+                    continue
+
             if entity_type == "tickets" and current is not None:
                 previous = dict(current.payload or {})
+                protected = ("packId","customerId","fare","paid","paymentMethod","balance") if previous.get("packId") else ()
+                if any(payload.get(k) != previous.get(k) for k in protected):
+                    conflicts.append({"type":"prepaid_protected","entityType":entity_type,"id":entity_id,"message":"Comptabilisation du carnet protégée"})
+                    continue
+                if previous.get("transfers") and payload.get("transfers") != previous.get("transfers"):
+                    conflicts.append({"type":"transfer_protected","entityType":entity_type,"id":entity_id,"message":"Historique de transfert protégé"})
+                    continue
                 if previous.get("refundId") and any(payload.get(k) != previous.get(k) for k in ("status", "refundId", "refundedAmount", "paid", "fare")):
                     conflicts.append({"type":"refund_protected", "entityType":entity_type, "id":entity_id, "message":"Un remboursement validé ne peut pas être modifié par synchronisation"})
                     continue
@@ -759,6 +829,9 @@ def sync_v2(req: SyncRequest, token: dict[str, Any] = Depends(read_token), db: S
                 moved = current is None or not transport_active(previous) or any(str(previous.get(k) or "") != str(payload.get(k) or "") for k in keys)
                 if moved:
                     try:
+                        if entity_type == "tickets":
+                            user = db.get(AppUser, token.get("uid"))
+                            validate_transport_tariff(db, company.id, payload, bool(user and (user.role in {"company_admin","superuser","admin"} or "manager" in (user.modules or {}).get("ticketRoles", []))))
                         validate_transport_seat(db, company.id, payload,
                             exclude_id=entity_id if entity_type == "tickets" else "",
                             reservation_id=entity_id if entity_type == "ticket_reservations" else "")
@@ -770,14 +843,7 @@ def sync_v2(req: SyncRequest, token: dict[str, Any] = Depends(read_token), db: S
             if current is None:
                 duplicate = find_recent_duplicate(db, company.id, entity_type, payload, req.deviceId)
                 if duplicate is not None:
-                    rejected_duplicate_ids.append(entity_id)
-                    conflicts.append({
-                        "type": "duplicate_operation",
-                        "entityType": entity_type,
-                        "id": entity_id,
-                        "duplicateOf": duplicate.entity_id,
-                        "message": "Double enregistrement bloqué par le serveur",
-                    })
+                    reject_alias(entity_type, entity_id, duplicate.entity_id)
                     continue
                 version = 1
                 payload["_serverVersion"] = version
@@ -834,7 +900,7 @@ def sync_v2(req: SyncRequest, token: dict[str, Any] = Depends(read_token), db: S
             result[row.entity_type].append(p)
     users = [user_public(u) for u in all_users if u.active]
     return {"serverTime": utcnow().isoformat(), "company": company_public(company), "users": users,
-            "conflicts": conflicts, "rejectedDuplicateIds": rejected_duplicate_ids,
+            "conflicts": conflicts, "rejectedDuplicateIds": rejected_duplicate_ids, "duplicateMap":duplicate_map,
             "accepted": accepted, "entities": result}
 
 
@@ -1431,7 +1497,7 @@ def tracking_page(company: str = Query(default=DEFAULT_COMPANY_CODE), code: str 
 
 @app.get("/")
 def root():
-    return {"service": "Transport Multi-Sociétés", "version": "4.7.0", "health": f"{PUBLIC_BASE_URL}/health", "tracking": f"{PUBLIC_BASE_URL}/suivi?company={DEFAULT_COMPANY_CODE}&code=OUA-00001"}
+    return {"service": "Transport Multi-Sociétés", "version": "4.8.0", "health": f"{PUBLIC_BASE_URL}/health", "tracking": f"{PUBLIC_BASE_URL}/suivi?company={DEFAULT_COMPANY_CODE}&code=OUA-00001"}
 
 
 # Interface web complète : le même client que l'application Android, avec les mêmes rôles.
@@ -1463,3 +1529,4 @@ if os.path.isdir(WEBAPP_DIR):
 
 # Additive transport APIs; existing entities and routes remain available.
 install_transport(app, globals())
+install_operations(app, globals())

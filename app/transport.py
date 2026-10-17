@@ -67,6 +67,27 @@ def bus_seats(bus):
             + [{"label":str(i+1),"class":"Simple"} for i in range(int(bus.get("simpleSeats") or 0))])
 
 
+def route_fare(route, trip, payload, seat_class):
+    """None preserves a historical route without a centrally configured tariff."""
+    import re
+    for line in re.split(r"[\n;]", str(route.get("segmentFares") or "")):
+        match = re.fullmatch(r"\s*(.+?)\s*>\s*(.+?)\s*=\s*([\d.]+)\s*,\s*([\d.]+)\s*", line)
+        if match and match[1].strip() == (payload.get("boardingPoint") or trip.get("origin")) and match[2].strip() == (payload.get("dropPoint") or trip.get("destination")):
+            return float(match[4 if seat_class == "VIP" else 3])
+    adult = "fareVip" if seat_class == "VIP" else "fareSimple"
+    key = ("fareChildVip" if seat_class == "VIP" else "fareChildSimple") if payload.get("passengerCategory") == "child" else adult
+    value = route.get(key, route.get(adult))
+    if value is None or value == "":
+        return None
+    try:
+        result = float(value)
+        if not math.isfinite(result) or result < 0:
+            raise ValueError()
+        return result
+    except (TypeError, ValueError):
+        raise HTTPException(422, "Tarif de ligne invalide")
+
+
 def lock_company(db, Company, company_id):
     if db.bind.dialect.name == "sqlite":
         db.execute(text("BEGIN IMMEDIATE"))
@@ -224,6 +245,24 @@ def install(app, env):
                     raise HTTPException(409, "Ce siège est déjà vendu ou réservé sur ce tronçon")
         return trip
 
+    def validate_tariff(db, cid, payload, manager=False):
+        tr = get(db, cid, "ticket_trips", str(payload.get("tripId") or ""))
+        bus = get(db, cid, "ticket_buses", str(tr.get("busId") or ""))
+        seat = next((s for s in bus_seats(bus) if str(s.get("label")) == str(payload.get("seat"))), None)
+        if not seat:
+            raise HTTPException(422, "Siège absent du plan du bus")
+        route_row = db.get(Entity, {"company_id":cid,"entity_type":"ticket_routes","entity_id":str(tr.get("routeId") or "")})
+        base = route_fare(route_row.payload if route_row and not route_row.deleted else {}, tr, payload, seat.get("class") or "Simple")
+        if base is not None:
+            discount = float(payload.get("discount") or 0)
+            if discount < 0 or discount > base or (discount and not manager):
+                raise HTTPException(403, "Seul le responsable peut autoriser une remise")
+            if not math.isclose(float(payload.get("fare") or 0), base-discount, abs_tol=0.001):
+                raise HTTPException(422, "Le tarif doit correspondre à la ligne et à la catégorie du voyageur")
+        return base
+
+    env["validate_transport_tariff"] = validate_tariff
+
     # Exposed to the legacy synchronization path: identical seat rules and lock.
     env["validate_transport_seat"] = validate_seat
 
@@ -236,6 +275,7 @@ def install(app, env):
                 raise HTTPException(403,"Réservation d’un autre agent")
             return existing.payload
         tr=validate_seat(db,c.id,req.model_dump())
+        validate_tariff(db,c.id,{**req.model_dump(),"fare":req.amount,"discount":0},False)
         try:
             expiry=datetime.fromisoformat(req.expiresAt.replace("Z","+00:00"))
             if expiry.tzinfo is None:
@@ -357,6 +397,7 @@ def install(app, env):
             if not math.isfinite(val) or val < 0:
                 raise HTTPException(422, "Montant invalide")
             t[field] = val
+        validate_tariff(db, c.id, t, u.role in {"company_admin","superuser","admin"} or "manager" in (u.modules or {}).get("ticketRoles", []))
         if t["paid"] > t["fare"]:
             raise HTTPException(422, "Le paiement dépasse le tarif")
         if reservation and t["paid"] < float(reservation.get("deposit") or 0):
@@ -369,13 +410,41 @@ def install(app, env):
         seat=next(s for s in bus_seats(bus) if str(s.get("label"))==str(t["seat"]))
         t["seatClass"]=seat.get("class") or "Simple"
         t["busLabel"]=f'{bus.get("name","")} {bus.get("registration","")}'.strip()
+        pack = None
+        if t.get("packId"):
+            pack=get(db,c.id,"travel_packs",str(t["packId"]))
+            if pack.get("customerId") != t.get("customerId") or pack.get("routeId") != trip.get("routeId") or pack.get("seatClass") != t["seatClass"]:
+                raise HTTPException(422,"Le carnet ne correspond pas au client, à la ligne ou à la classe")
+            if str(pack.get("expiresOn") or "") < now().date().isoformat() or int(pack.get("remaining") or 0)<1:
+                raise HTTPException(409,"Carnet expiré ou épuisé")
+            if t["paid"] != 0:
+                raise HTTPException(422,"Un voyage prépayé ne doit pas être encaissé une seconde fois")
+        if t.get("documentNumber"):
+            normalized="".join(str(t["documentNumber"]).upper().split())
+            doc=next((d for d in rows(db,c.id,"customer_documents") if d.get("active") and d.get("number")==normalized),None)
+            if doc:
+                if t.get("customerId") and t["customerId"] != doc["customerId"]:
+                    raise HTTPException(422,"La pièce et le carnet ne correspondent pas au même client")
+                t["customerId"]=doc["customerId"]
         t.update(createdBy=u.id, createdByName=u.name, agency=u.agency, status="Confirmé", boarded=False, noShow=False, balance=max(0,t["fare"]-t["paid"]), origin=trip.get("origin"), destination=trip.get("destination"), departureAt=trip.get("departureAt"), createdAt=now().isoformat(), confirmationSource="server")
         t = put(db, c.id, "tickets", t)
+        if pack:
+            t=put(db,c.id,"tickets",{**t,"balance":0,"paymentMethod":"Carnet prépayé"})
+            put(db,c.id,"travel_packs",{**pack,"remaining":int(pack["remaining"])-1,"redemptions":[*pack.get("redemptions",[]),{"ticketId":t["id"],"at":now().isoformat()}]})
         if req.holdId:
             put(db, c.id, "ticket_holds", {**h,"status":"Convertie","ticketId":t["id"]})
         if reservation:
             put(db, c.id, "ticket_reservations", {**reservation,"status":"Convertie","ticketId":t["id"]})
         audit(db,c,u,"Billet confirmé",str(t.get("pnr") or t["id"]))
+        return {"ticket":t}
+
+    @app.get("/api/v2/transport/tickets/{ticket_id}")
+    def recover_ticket(ticket_id: str, token=Depends(auth), db=Depends(session)):
+        c,u=access(db,token,"sales",True)
+        t=get(db,c.id,"tickets",ticket_id)
+        if t.get("createdBy")!=u.id and u.role not in {"admin","company_admin","superuser"}:
+            raise HTTPException(403,"Billet d’un autre agent")
+        db.commit()
         return {"ticket":t}
 
     @app.post("/api/v2/transport/tickets/confirm")
@@ -407,6 +476,10 @@ def install(app, env):
             raise HTTPException(422,"Le remboursement dépasse le montant encaissé")
         r = put(db,c.id,"ticket_refunds",{"ticketId":ticket_id,"pnr":t.get("pnr"),"tripId":t.get("tripId"),"amount":req.amount,"reason":req.reason,"status":"Validé","paymentMethod":t.get("paymentMethod"),"agency":u.agency,"createdBy":u.id,"createdByName":u.name,"createdAt":now().isoformat()})
         t = put(db,c.id,"tickets",{**t,"status":"Remboursé","refundId":r["id"],"refundedAmount":req.amount,"refundReason":req.reason,"cancelledAt":now().isoformat()})
+        if t.get("packId"):
+            pack=get(db,c.id,"travel_packs",t["packId"])
+            redemptions=[{**r,"returnedAt":now().isoformat()} if r.get("ticketId")==ticket_id else r for r in pack.get("redemptions",[])]
+            put(db,c.id,"travel_packs",{**pack,"remaining":min(int(pack["journeys"]),int(pack["remaining"])+1),"redemptions":redemptions})
         audit(db,c,u,"Billet remboursé",str(t.get("pnr")))
         db.commit()
         return {"ticket":t,"refund":r}
@@ -477,7 +550,7 @@ def install(app, env):
                 result.append(existing.payload)
                 continue
             # Explicit allowlist prevents copying arrival/manifest/dispatch state.
-            copy={k:tr[k] for k in ("routeId","busId","origin","destination","stops","boardingPoint","dropPoint","fareSimple","fareVip","capacityOverride","driver","conductor","cargoCapacityKg","cargoCapacityCount") if k in tr}
+            copy={k:tr[k] for k in ("routeId","busId","origin","destination","stops","boardingPoint","dropPoint","fareSimple","fareVip","fareChildSimple","fareChildVip","capacityOverride","driver","conductor","driverId","conductorId","cargoCapacityKg","cargoCapacityCount") if k in tr}
             result.append(put(db,c.id,"ticket_trips",{**copy,"id":ident,"departureAt":at.isoformat(),"status":"Planifié","repeatSourceId":trip_id,"createdAt":now().isoformat(),"createdBy":u.id}))
         audit(db,c,u,"Départs récurrents créés",trip_id)
         db.commit()

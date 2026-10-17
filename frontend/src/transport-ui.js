@@ -1,4 +1,4 @@
-import { allocationActive, isoLocal } from './transport-model.js';
+import { allocationActive, isoLocal, segmentFare } from './transport-model.js';
 import './transport.css';
 
 export function createTransportUi(ctx) {
@@ -11,7 +11,7 @@ export function createTransportUi(ctx) {
     const r=await fetch(ctx.serverUrl()+'/api/v2/transport'+path,{method,headers:{'Content-Type':'application/json',Authorization:'Bearer '+state.authToken},...(body!==undefined?{body:JSON.stringify(body)}:{})});
     if(company!==state.company?.id)throw new Error('La société active a changé');
     const data=await r.json().catch(()=>({detail:'Réponse serveur invalide'}));
-    if(!r.ok)throw new Error(typeof data.detail==='string'?data.detail:JSON.stringify(data.detail||data));
+    if(!r.ok){const error=new Error(typeof data.detail==='string'?data.detail:JSON.stringify(data.detail||data));error.status=r.status;throw error;}
     return data;
   }
   async function synced() {
@@ -80,6 +80,9 @@ export function createTransportUi(ctx) {
 
     const reservation=document.querySelector('#ticketReservationForm');
     if(reservation){
+      reservation.classList.add('no-wizard');
+      const updateReservationFare=()=>{const tr=state.ticketTrips.find(t=>t.id===reservation.elements.tripId.value),bus=state.ticketBuses.find(b=>b.id===tr?.busId),seat=ctx.busSeats(bus||{}).find(s=>String(s.label)===reservation.elements.seat.value.trim());reservation.elements.amount.readOnly=true;reservation.elements.amount.value=tr&&seat?segmentFare(state.ticketRoutes.find(r=>r.id===tr.routeId),tr,tr.origin,tr.destination,seat.class):''};
+      reservation.elements.tripId.addEventListener('change',updateReservationFare);reservation.elements.seat.addEventListener('input',updateReservationFare);updateReservationFare();
       if(!reservation.elements.expiresAt)reservation.querySelector('.grid')?.insertAdjacentHTML('beforeend','<label>Expiration de la réservation<input type="datetime-local" name="expiresAt" required></label>');
       reservation.onsubmit=e=>{e.preventDefault();run(reservation.querySelector('button'),async()=>{
         await synced();const d=Object.fromEntries(new FormData(reservation)),tr=state.ticketTrips.find(t=>t.id===d.tripId);
@@ -167,7 +170,7 @@ export function createTransportUi(ctx) {
     finally {holding=false;}
   }
   async function confirmTicket(ticket) {
-    if(!navigator.onLine)return {...ticket,status:'À synchroniser',confirmationSource:'offline'};
+    if(!navigator.onLine){if(ticket.packId)throw new Error('Un carnet prépayé nécessite une connexion pour éviter deux débits concurrents');return {...ticket,status:'À synchroniser',confirmationSource:'offline'}};
     if(holding)throw new Error('Attendez la confirmation du blocage du siège');
     const data=await api('/tickets/confirm',{ticket,holdId:hold?.id||''});hold=null;
     return data.ticket;
@@ -176,5 +179,5 @@ export function createTransportUi(ctx) {
     const old=hold;hold=null;
     if(old&&navigator.onLine)api('/holds/'+old.id,undefined,'DELETE').catch(()=>{});
   }
-  return {panel,bind,confirmTicket,selectSeat,releaseHold,enhanceTicket};
+  return {panel,bind,recoverTicket:async id=>(await api('/tickets/'+encodeURIComponent(id),undefined,'GET')).ticket,confirmTicket,selectSeat,releaseHold,enhanceTicket};
 }

@@ -1,2 +1,13 @@
 .transport-hero{display:flex;align-items:center;justify-content:space-between;gap:20px;border-left:5px solid var(--company-primary,#075f4e);background:linear-gradient(120deg,#f0faf6,#fff)}
 .transport-hero h2{margin:8px 0}.transport-hero p{max-width:620px;line-height:1.6}.transport-grid{align-items:start}.transport-grid .panel{min-width:0}.transport-grid .compact-list>div{display:flex;flex-direction:column;align-items:stretch;gap:8px;padding:16px 0;border-bottom:1px solid #e5ece9}.transport-grid small,.transport-grid p{line-height:1.6}.transport-alerts{display:grid;gap:8px}.transport-alerts>div{display:flex;gap:16px;padding:12px 16px;border-left:4px solid #d99a20;background:#fff8e8;border-radius:8px}.transport-good{padding:16px;background:#eaf7ef;color:#176139;border-radius:10px}.transport-financial{display:grid;gap:10px;margin:18px 0}.transport-financial span{display:flex;justify-content:space-between;gap:14px;padding-bottom:8px;border-bottom:1px solid #edf0ee}.transport-grid form button{margin-top:12px}.seat.holding{opacity:.65;cursor:wait}@media(max-width:700px){.transport-hero{display:block}.transport-hero>button{margin-top:12px}.transport-alerts>div{flex-direction:column;gap:4px}}
+
+/* A selected seat remains distinct from availability and booked seats. */
+.seat.selected,.seat.vip.selected,.seat.simple.selected{background:#dc2626!important;color:#fff!important;border-color:#991b1b!important;box-shadow:0 0 0 3px #fecaca}
+.seat.selected small{color:#fff}
+input[readonly]{background:#f1f5f9;color:#334155}
+
+.ops-tabs{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0}.board-table{overflow:auto}.board-table table{width:100%;border-collapse:collapse}.board-table th,.board-table td{text-align:left;padding:16px 12px;border-bottom:1px solid #cbd5e1}.board-table td small{display:block}.station-board{background:#071d32;color:#f1f5f9}.station-board:fullscreen{width:100vw;height:100vh;padding:40px;overflow:auto;border-radius:0}.station-board h2{color:white;font-size:36px}.station-board th{color:#93c5fd;letter-spacing:.08em;text-transform:uppercase}.station-board td{font-size:24px;border-color:#244461}.board-status{color:#6ee7b7}.station-board p{color:#b8cadd}.ops-identity-result{display:grid;gap:8px;padding:16px 0;border-bottom:1px solid #e2e8f0}.transport-warning{color:#b45309;font-weight:700}#opsShareLink{overflow-wrap:anywhere}
+
+.ops-document-photo{max-width:100%;max-height:300px;object-fit:contain}#opsAiResult{white-space:pre-wrap;font:inherit;line-height:1.65}
+
+.ticket-counter-sale label[hidden]{display:none!important}

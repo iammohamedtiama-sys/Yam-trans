@@ -5,12 +5,14 @@ export function allocationActive(item, at = Date.now()) {
   return true;
 }
 
-export function segmentFare(route, trip, from, to, seatClass) {
+export function segmentFare(route, trip, from, to, seatClass, category = 'adult') {
   for (const line of String(route?.segmentFares || '').split(/[\n;]/)) {
     const match = line.match(/^\s*(.+?)\s*>\s*(.+?)\s*=\s*([\d.]+)\s*,\s*([\d.]+)\s*$/);
     if (match && match[1].trim() === from && match[2].trim() === to) return Number(match[seatClass === 'VIP' ? 4 : 3]);
   }
-  return Number(seatClass === 'VIP' ? trip?.fareVip || 0 : trip?.fareSimple || 0);
+  const key = category === 'child' ? (seatClass === 'VIP' ? 'fareChildVip' : 'fareChildSimple') : (seatClass === 'VIP' ? 'fareVip' : 'fareSimple');
+  const adultKey = seatClass === 'VIP' ? 'fareVip' : 'fareSimple';
+  return Number(route?.[key] ?? route?.[adultKey] ?? trip?.[key] ?? trip?.[adultKey] ?? 0);
 }
 
 export function peakOccupancy(trip, tickets) {

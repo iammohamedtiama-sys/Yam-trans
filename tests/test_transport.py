@@ -269,3 +269,292 @@ def test_company_isolation_and_role_check(setup):
     assert post(hs,'/trips/trip/closure',{"countedCash":0}).status_code==403
     with m.SessionLocal() as db:
         db.delete(db.get(m.AppUser,'other-user'));db.delete(db.get(m.Company,'other'));db.commit()
+
+# 4.8 regression cases exercise retries, finance, private data and shared workflows.
+def ops(h,path,data=None,method='POST'):
+    return client.request(method,'/api/v2/operations'+path,headers=h,json=data)
+
+
+def configure_route(cid):
+    with m.SessionLocal() as db:
+        tr=db.get(m.EntityV3,{'company_id':cid,'entity_type':'ticket_trips','entity_id':'trip'})
+        tr.payload={**tr.payload,'routeId':'route'}
+        db.add(m.EntityV3(company_id=cid,entity_type='ticket_routes',entity_id='route',payload={'id':'route','origin':'Ouaga','destination':'Bobo','fareSimple':5000,'fareVip':7000,'fareChildSimple':2500,'fareChildVip':4000},version=1,updated_at=m.utcnow(),deleted=False));db.commit()
+
+
+def test_courier_retry_discards_associated_cash_and_persists_alias(setup):
+    h,cid,_=setup
+    created=datetime.now(timezone.utc).isoformat()
+    original={'id':'original','clientOperationId':'key-1','createdBy':'agent','code':'OUA-100','senderName':'Client','senderPhone':'70000001','receiverName':'Dest','receiverPhone':'70000002','origin':'Ouaga','destination':'Bobo','type':'Colis','fee':1000,'paid':1000,'createdAt':created}
+    def sync(entities):return client.post('/api/v2/sync',headers=h,json={'deviceId':'terminal','entities':entities})
+    assert not sync({'shipments':[original],'payments':[{'id':'p1','shipmentId':'original','amount':1000}]}).json()['conflicts']
+    retry={**original,'id':'duplicate','code':'OUA-101','createdAt':(datetime.now(timezone.utc)+timedelta(days=1)).isoformat()}
+    r=sync({'shipments':[retry],'payments':[{'id':'p2','shipmentId':'duplicate','amount':1000}]}).json()
+    assert set(r['rejectedDuplicateIds'])=={'duplicate','p2'}
+    assert r['duplicateMap']['duplicate']=='original'
+    assert {p['id'] for p in r['entities']['payments']}=={'p1'}
+    later=sync({'payments':[{'id':'p3','shipmentId':'duplicate','amount':1000}]}).json()
+    assert later['rejectedDuplicateIds']==['p3']
+    assert len(later['entities']['payments'])==1
+    assert not any(k in later['entities'] for k in ('operation_aliases','customer_documents'))
+
+
+def test_reusing_operation_key_with_different_amount_is_rejected(setup):
+    h,_,_=setup
+    p={'id':'one','clientOperationId':'stable','createdBy':'agent','code':'ONE','fee':1000}
+    assert client.post('/api/v2/sync',headers=h,json={'deviceId':'test','entities':{'shipments':[p]}}).status_code==200
+    assert client.post('/api/v2/sync',headers=h,json={'deviceId':'test','entities':{'shipments':[{**p,'id':'two','fee':2000}]}}).status_code==409
+
+
+def test_central_tariff_rejects_modified_price_and_supports_child(setup):
+    h,cid,_=setup;configure_route(cid)
+    assert post(h,'/tickets/confirm',{'ticket':ticket(fare=4000,paid=4000)}).status_code==422
+    child=post(h,'/tickets/confirm',{'ticket':ticket(fare=2500,paid=2500,passengerCategory='child',assistance='Déficience visuelle')})
+    assert child.status_code==200,child.text
+    assert child.json()['ticket']['seatClass']=='Simple'
+    assert child.json()['ticket']['fare']==2500
+
+
+def test_sync_cannot_bypass_central_tariff(setup):
+    h,cid,_=setup;configure_route(cid)
+    r=client.post('/api/v2/sync',headers=h,json={'deviceId':'test','entities':{'tickets':[ticket(fare=5,paid=5)]}}).json()
+    assert r['conflicts'] and not r['entities']['tickets']
+
+
+def test_parking_is_idempotent_and_separate_from_transport(setup):
+    h,_,_=setup
+    p={'id':'parking','registration':'BF-123','vehicleType':'Moto','customerName':'Client','phone':'70000000','condition':'Rayure gauche','rate':500,'pricing':'jour'}
+    one=ops(h,'/parking',p);two=ops(h,'/parking',p)
+    assert one.status_code==200,one.text
+    assert one.json()==two.json()
+    assert ops(h,'/parking',{**p,'id':'another'}).status_code==409
+    assert ops(h,'/parking/parking/release',{'paid':200,'condition':'Identique'}).status_code==422
+    release=ops(h,'/parking/parking/release',{'paid':500,'condition':'Identique'})
+    assert release.status_code==200,release.text
+    assert ops(h,'/parking/parking/release',{'paid':500,'condition':'Identique'}).json()==release.json()
+    report=ops(h,'/analysis',method='GET').json()
+    assert report['parkingIncome']==500
+    assert report['trips'][0]['income']==0
+
+
+def test_fleet_retry_creates_one_expense_in_profitability(setup):
+    h,_,_=setup
+    p={'id':'fuel','busId':'bus','tripId':'trip','kind':'Carburant','label':'Gasoil','amount':10000,'quantity':15}
+    assert ops(h,'/fleet',p).status_code==200
+    assert ops(h,'/fleet',p).status_code==200
+    report=ops(h,'/analysis',method='GET').json()
+    assert report['trips'][0]['expenses']==10000
+    assert report['trips'][0]['net']==-10000
+    assert len(report['suggestions'])==1
+
+
+def test_public_tracking_has_real_timestamp_and_no_passenger_data(setup):
+    h,_,_=setup
+    post(h,'/tickets/confirm',{'ticket':ticket(documentNumber='SECRET-ID')})
+    share=ops(h,'/trips/trip/share',{}).json();token=share['url'].split('/')[-1]
+    event=ops(h,'/trips/trip/tracking',{'id':'position','stage':'Position','latitude':12.3,'longitude':-1.5,'accuracy':20})
+    assert event.status_code==200,event.text
+    data=client.get('/api/v2/public/voyage/'+token)
+    assert data.status_code==200
+    assert data.json()['position']['latitude']==12.3
+    assert data.json()['position']['createdAt']
+    assert 'SECRET-ID' not in data.text and 'Voyageur' not in data.text and '70000001' not in data.text
+    assert client.get('/voyage/'+token).status_code==200
+    assert ops(h,'/shares/'+share['id'],method='DELETE').status_code==200
+    assert client.get('/api/v2/public/voyage/'+token).status_code==404
+
+
+def test_tracking_rejects_incomplete_or_fake_coordinates(setup):
+    h,_,_=setup
+    assert ops(h,'/trips/trip/tracking',{'id':'gps','stage':'Position'}).status_code==422
+    assert ops(h,'/trips/trip/tracking',{'id':'gps','stage':'Position','latitude':12.3}).status_code==422
+    assert ops(h,'/trips/trip/tracking',{'id':'gps','stage':'Position','latitude':200,'longitude':0}).status_code==422
+
+
+def test_identity_renewal_preserves_customer_and_no_public_document(setup):
+    h,_,_=setup
+    p={'id':'doc','customerId':'customer','customerName':'Client','phone':'70000001','kind':'CNIB','number':'B 1234'}
+    assert ops(h,'/documents',p).status_code==200
+    t=post(h,'/tickets/confirm',{'ticket':ticket(documentNumber='B1234')}).json()['ticket']
+    assert t['customerId']=='customer'
+    assert ops(h,'/documents',{**p,'id':'new','number':'A9999','kind':'Passeport','replacesId':'doc'}).status_code==200
+    assert ops(h,'/documents/lookup?number=B1234',method='GET').status_code==404
+    result=ops(h,'/documents/lookup?number=A9999',method='GET')
+    assert result.status_code==200,result.text
+    assert result.json()['tickets'][0]['id']==t['id']
+    state=ops(h,'/state',method='GET')
+    assert 'B1234' not in state.text and 'A9999' not in state.text
+
+
+def test_prepaid_pack_redemption_atomic_and_retry_once(setup):
+    h,cid,_=setup;configure_route(cid)
+    p={'id':'pack','customerId':'customer','customerName':'Client','phone':'70000001','routeId':'route','journeys':10,'amount':45000,'expiresOn':(datetime.now(timezone.utc)+timedelta(days=90)).date().isoformat()}
+    assert ops(h,'/packs',p).status_code==200
+    assert ops(h,'/packs',p).status_code==200
+    t=ticket(packId='pack',customerId='customer',paid=0)
+    one=post(h,'/tickets/confirm',{'ticket':t});two=post(h,'/tickets/confirm',{'ticket':t})
+    assert one.status_code==200,one.text
+    assert one.json()==two.json()
+    assert one.json()['ticket']['balance']==0
+    state=ops(h,'/state',method='GET').json()
+    assert state['travel_packs'][0]['remaining']==9
+    report=ops(h,'/analysis',method='GET').json()
+    assert report['prepaidIncome']==45000 and report['trips'][0]['cashIncome']==0
+    assert report['trips'][0]['prepaidAllocated']==4500 and report['trips'][0]['income']==4500
+
+
+def test_pack_cannot_be_redeemed_for_other_customer_or_sync(setup):
+    h,cid,_=setup;configure_route(cid)
+    p={'id':'pack','customerId':'customer','customerName':'Client','phone':'70000001','routeId':'route','journeys':10,'amount':45000,'expiresOn':(datetime.now(timezone.utc)+timedelta(days=90)).date().isoformat()}
+    ops(h,'/packs',p)
+    assert post(h,'/tickets/confirm',{'ticket':ticket(packId='pack',customerId='other',paid=0)}).status_code==422
+    r=client.post('/api/v2/sync',headers=h,json={'deviceId':'test','entities':{'tickets':[ticket(packId='pack',customerId='customer',paid=0)]}}).json()
+    assert r['conflicts'][0]['type']=='prepaid_online_required'
+
+
+def test_transfer_preserves_cash_releases_original_seat_and_retries(setup):
+    h,cid,departure=setup
+    post(h,'/tickets/confirm',{'ticket':ticket()})
+    r=client.post('/api/v2/sync',headers=h,json={'deviceId':'test','entities':{'ticket_trips':[{'id':'new-trip','busId':'bus','origin':'Ouaga','destination':'Bobo','departureAt':departure,'status':'Publié'}]}})
+    assert r.status_code==200
+    p={'id':'transfer','tripId':'new-trip','seat':'A1','reason':'Voyageur change de départ'}
+    one=ops(h,'/tickets/ticket/transfer',p);two=ops(h,'/tickets/ticket/transfer',p)
+    assert one.status_code==200,one.text
+    assert one.json()==two.json()
+    assert one.json()['paid']==5000
+    assert len(one.json()['transfers'])==1
+    assert post(h,'/tickets/confirm',{'ticket':ticket('next')}).status_code==200
+
+
+def test_crew_assignment_rejects_free_text_or_unknown_account(setup):
+    h,_,_=setup
+    assert ops(h,'/trips/trip/crew',{'driverId':'John','conductorId':''},'PUT').status_code==422
+
+
+def user_headers(cid, ident, roles):
+    with m.SessionLocal() as db:
+        user=db.get(m.AppUser,ident)
+        if not user:
+            user=m.AppUser(id=ident,company_id=cid,username=ident,name='Équipage test',password_hash=m.password_hash('not-used'),role='agency',agency='Ouaga',active=True,modules={'tickets':True,'ticketRoles':roles},created_at=m.utcnow());db.add(user)
+        else:
+            user.company_id=cid;user.active=True;user.modules={'tickets':True,'ticketRoles':roles}
+        c=db.get(m.Company,cid);token=m.make_token(user,c);db.commit()
+    return {'Authorization':'Bearer '+token}
+
+
+def test_driver_cannot_read_identity_or_modify_another_trip(setup):
+    h,cid,_=setup
+    driver=user_headers(cid,'driver-test',['driver'])
+    assert ops(driver,'/state',method='GET').status_code==200
+    assert ops(driver,'/documents/lookup?number=B1234',method='GET').status_code==403
+    assert ops(driver,'/trips/trip/tracking',{'id':'incident','stage':'Incident','message':'Embouteillage'}).status_code==403
+    assert ops(h,'/trips/trip/crew',{'driverId':'driver-test','conductorId':''},'PUT').status_code==200
+    assert ops(driver,'/trips/trip/tracking',{'id':'incident','stage':'Incident','message':'Embouteillage'}).status_code==200
+    assert 'customer_documents' not in ops(driver,'/state',method='GET').json()
+
+
+def test_sales_agent_cannot_change_tariff_or_take_discount(setup):
+    h,cid,_=setup;configure_route(cid)
+    sales=user_headers(cid,'sales-test',['sales'])
+    assert post(sales,'/tickets/confirm',{'ticket':ticket(fare=4000,paid=4000,discount=1000)}).status_code==403
+    r=client.post('/api/v2/sync',headers=sales,json={'deviceId':'test','entities':{'ticket_routes':[{'id':'route','fareSimple':1}]}})
+    assert r.status_code==200
+    assert r.json()['conflicts'][0]['type']=='tariff_protected'
+    assert post(sales,'/tickets/confirm',{'ticket':ticket()}).status_code==200
+
+
+def test_ocr_reads_local_image_and_rejects_non_images(setup):
+    import base64,io
+    from PIL import Image,ImageDraw,ImageFont
+    h,_,_=setup
+    image=Image.new('RGB',(1200,220),'white');draw=ImageDraw.Draw(image)
+    font=ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',70)
+    draw.text((35,55),'CNIB B12345678',font=font,fill='black')
+    buffer=io.BytesIO();image.save(buffer,format='PNG')
+    photo='data:image/png;base64,'+base64.b64encode(buffer.getvalue()).decode()
+    result=ops(h,'/documents/ocr',{'image':photo})
+    assert result.status_code==200,result.text
+    assert 'B12345678' in result.json()['text']
+    assert result.json()['requiresConfirmation'] is True
+    assert ops(h,'/documents/ocr',{'image':'data:image/png;base64,aGVsbG8='}).status_code==422
+    doc={'id':'photo-doc','customerId':'client','customerName':'Client','phone':'70000000','kind':'CNIB','number':'B12345678','photo':photo}
+    assert ops(h,'/documents',doc).status_code==200
+    assert ops(h,'/documents/lookup?number=B12345678',method='GET').json()['photo']==photo
+    assert photo not in ops(h,'/state',method='GET').text
+
+
+def test_ai_missing_configuration_is_explicit_not_fake_analysis(setup,monkeypatch):
+    h,_,_=setup
+    monkeypatch.delenv('YAMTRANS_AI_API_KEY',raising=False);monkeypatch.delenv('YAMTRANS_AI_MODEL',raising=False)
+    r=ops(h,'/analysis/ai',{})
+    assert r.status_code==503 and 'configurés' in r.json()['detail']
+
+
+def test_ai_sends_aggregates_without_customer_or_employee_identity(setup,monkeypatch):
+    import json
+    from app import analysis_ai
+    h,_,_=setup
+    post(h,'/tickets/confirm',{'ticket':ticket(passengerName='PRIVATE-NAME',documentNumber='PRIVATE-DOC')})
+    monkeypatch.setenv('YAMTRANS_AI_API_KEY','test-key');monkeypatch.setenv('YAMTRANS_AI_MODEL','test-model')
+    seen=[]
+    class Response:
+        def __enter__(self):return self
+        def __exit__(self,*args):pass
+        def read(self,*args):return json.dumps({'choices':[{'message':{'content':'Vérifier les coûts saisis.'}}]}).encode()
+    def fake(req,**kwargs):
+        body=req.data.decode();assert 'PRIVATE-NAME' not in body and 'PRIVATE-DOC' not in body and '70000001' not in body
+        seen.append(body);return Response()
+    monkeypatch.setattr(analysis_ai.request,'urlopen',fake)
+    result=ops(h,'/analysis/ai',{})
+    assert result.status_code==200,result.text
+    assert result.json()['model']=='test-model' and len(seen)==1
+
+
+def test_cancelling_prepaid_ticket_restores_one_journey(setup):
+    h,cid,_=setup;configure_route(cid)
+    p={'id':'pack','customerId':'customer','customerName':'Client','phone':'70000001','routeId':'route','journeys':10,'amount':45000,'expiresOn':(datetime.now(timezone.utc)+timedelta(days=90)).date().isoformat()}
+    ops(h,'/packs',p)
+    post(h,'/tickets/confirm',{'ticket':ticket(packId='pack',customerId='customer',paid=0)})
+    r=post(h,'/tickets/ticket/refund',{'amount':0,'reason':'Annulation du trajet prépayé'})
+    assert r.status_code==200,r.text
+    assert ops(h,'/state',method='GET').json()['travel_packs'][0]['remaining']==10
+    assert post(h,'/tickets/ticket/refund',{'amount':0,'reason':'Même demande'}).status_code==409
+    assert ops(h,'/state',method='GET').json()['travel_packs'][0]['remaining']==10
+
+
+def test_concurrent_prepaid_sales_cannot_overdraw_last_journey(setup):
+    h,cid,_=setup;configure_route(cid)
+    p={'id':'pack','customerId':'customer','customerName':'Client','phone':'70000001','routeId':'route','journeys':1,'amount':4500,'expiresOn':(datetime.now(timezone.utc)+timedelta(days=90)).date().isoformat()}
+    ops(h,'/packs',p)
+    # Use two disjoint segments of the same Simple seat: allocation itself permits both.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results=list(pool.map(lambda n:post(h,'/tickets/confirm',{'ticket':ticket(str(n),packId='pack',customerId='customer',paid=0,boardingPoint='Ouaga' if n==0 else 'Boromo',dropPoint='Boromo' if n==0 else 'Bobo')}).status_code,range(2)))
+    assert sorted(results)==[200,409]
+    assert ops(h,'/state',method='GET').json()['travel_packs'][0]['remaining']==0
+
+
+def test_interrupted_confirmation_can_be_recovered_without_reissuing(setup):
+    h,_,_=setup
+    original=post(h,'/tickets/confirm',{'ticket':ticket()}).json()['ticket']
+    recovered=client.get('/api/v2/transport/tickets/ticket',headers=h)
+    assert recovered.status_code==200
+    assert recovered.json()['ticket']==original
+    assert client.get('/api/v2/transport/tickets/missing',headers=h).status_code==404
+
+
+def test_profitability_uses_peak_seats_for_successive_segments(setup):
+    h,_,_=setup
+    assert post(h,'/tickets/confirm',{'ticket':ticket('first',dropPoint='Boromo')}).status_code==200
+    assert post(h,'/tickets/confirm',{'ticket':ticket('second',boardingPoint='Boromo')}).status_code==200
+    report=ops(h,'/analysis',method='GET').json()
+    tr=report['trips'][0]
+    assert tr['tickets']==2 and tr['peakPassengers']==1 and tr['capacity']==2
+    assert tr['occupancyPct']==50
+    assert len(report['agents'])==1 and report['agents'][0]['ticketCash']==10000
+
+
+def test_central_tariff_also_protects_reservation_deposits(setup):
+    h,cid,_=setup;configure_route(cid)
+    data={"id":"reservation","tripId":"trip","seat":"A1","passengerName":"Client","phone":"70000002","amount":10000,"deposit":10000,"expiresAt":(datetime.now(timezone.utc)+timedelta(hours=2)).isoformat()}
+    assert post(h,'/reservations',data).status_code==422
+    assert post(h,'/reservations',{**data,'amount':5000,'deposit':2000}).status_code==200

@@ -22,3 +22,12 @@ test('les recettes conservent la retenue après un remboursement partiel',()=>{
   assert.equal(ticketNetReceipts({paid:5000,status:'Remboursé'}),0);
   assert.equal(ticketNetReceipts({paid:0,fare:5000,status:'Confirmé'}),0);
 });
+
+test('le tarif central de ligne reste prioritaire sur celui du bus ou départ',()=>{
+  assert.equal(segmentFare({fareSimple:6000,fareVip:8500},{...trip,fareSimple:100},'Ouaga','Bobo','Simple'),6000);
+});
+test('la catégorie enfant est indépendante de la classe du siège',()=>{
+  const route={fareSimple:5000,fareVip:7000,fareChildSimple:2500,fareChildVip:4000};
+  assert.equal(segmentFare(route,trip,'Ouaga','Bobo','VIP','child'),4000);
+  assert.equal(segmentFare(route,trip,'Ouaga','Bobo','Simple','child'),2500);
+});
