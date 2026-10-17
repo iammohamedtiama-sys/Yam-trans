@@ -61,18 +61,19 @@ class OcrRequest(BaseModel):
 
 class DocumentRequest(BaseModel):
     id: str = Field(min_length=1, max_length=120)
-    customerId: str = Field(min_length=1, max_length=120)
+    customerId: str = Field(default='', max_length=120)
     customerName: str = Field(min_length=1, max_length=160)
     phone: str = Field(min_length=3, max_length=50)
     kind: Literal['CNIB', 'Passeport', 'Autre']
     number: str = Field(min_length=3, max_length=100)
     expiresOn: str = ''
     replacesId: str = ''
+    previousNumber: str = Field(default='',max_length=100)
     photo: str = Field(default='',max_length=7_000_000)
 
 class PackRequest(BaseModel):
     id: str = Field(min_length=1, max_length=120)
-    customerId: str = Field(min_length=1, max_length=120)
+    customerId: str = Field(default='', max_length=120)
     customerName: str = Field(min_length=1, max_length=160)
     phone: str = Field(min_length=3, max_length=50)
     routeId: str = Field(min_length=1, max_length=120)
@@ -153,6 +154,26 @@ def install(app, env):
         if p.get('driverId')==p.get('conductorId'):
             raise HTTPException(422,'Chauffeur et convoyeur doivent être distincts')
     env['validate_crew']=crew_validate
+
+    def resolve_customer(db,cid,req):
+        phone=''.join(ch for ch in req.phone if ch.isdigit())
+        if len(phone)==8:phone='226'+phone
+        name=' '.join(req.customerName.casefold().split())
+        if req.customerId:
+            known=next((p for kind in ('ticket_customers','customers') for p in rows(db,cid,kind) if p.get('id')==req.customerId),None)
+            # Compatibility with stable customers created by older private document records.
+            if not known and not any(p.get('customerId')==req.customerId for p in rows(db,cid,'customer_documents')):
+                put(db,cid,'ticket_customers',{'id':req.customerId,'name':req.customerName,'phone':'+'+phone,'points':0,'createdAt':now().isoformat()})
+            return req.customerId
+        for kind in ('ticket_customers','customers'):
+            for person in rows(db,cid,kind):
+                other=''.join(ch for ch in str(person.get('phone') or '') if ch.isdigit())
+                if len(other)==8:other='226'+other
+                if other==phone and ' '.join(str(person.get('name') or '').casefold().split())==name:
+                    return person['id']
+        ident=str(uuid.uuid4())
+        put(db,cid,'ticket_customers',{'id':ident,'name':req.customerName,'phone':'+'+phone,'points':0,'createdAt':now().isoformat()})
+        return ident
 
     @app.get('/api/v2/operations/state')
     def state(token=Depends(auth),db=Depends(session)):
@@ -279,12 +300,21 @@ def install(app, env):
         if req.expiresOn and date(req.expiresOn)<now().date():raise HTTPException(422,'La pièce est déjà expirée')
         matches=[p for p in rows(db,c.id,'customer_documents') if p['number']==number and p.get('active')]
         if matches:raise HTTPException(409,'Cette pièce est déjà enregistrée')
+        previous=None
         if req.replacesId:
             previous=get(db,c.id,'customer_documents',req.replacesId)
-            if previous['customerId']!=req.customerId:raise HTTPException(422,'Le renouvellement doit conserver le même client')
+        elif req.previousNumber:
+            previous_number=''.join(req.previousNumber.upper().split())
+            previous=next((p for p in rows(db,c.id,'customer_documents') if p.get('number')==previous_number and p.get('active')),None)
+            if not previous:raise HTTPException(404,'Ancienne pièce introuvable : vérifiez son numéro')
+        customer_id=previous['customerId'] if previous else resolve_customer(db,c.id,req)
+        if previous:
+            if req.customerId and previous['customerId']!=req.customerId:raise HTTPException(422,'Le renouvellement doit conserver le même client')
             put(db,c.id,'customer_documents',{**previous,'active':False,'replacedBy':req.id})
-        item=put(db,c.id,'customer_documents',{**req.model_dump(),'number':number,'active':True,'createdBy':u.id,'createdAt':now().isoformat()})
-        audit(db,c,u,'Pièce client enregistrée',req.customerId);db.commit();return {'id':item['id'],'customerId':item['customerId']}
+            customer=next((p for p in rows(db,c.id,'ticket_customers') if p['id']==customer_id),{'id':customer_id,'points':0})
+            put(db,c.id,'ticket_customers',{**customer,'name':req.customerName,'phone':req.phone})
+        item=put(db,c.id,'customer_documents',{**req.model_dump(),'customerId':customer_id,'replacesId':previous['id'] if previous else '', 'number':number,'active':True,'createdBy':u.id,'createdAt':now().isoformat()})
+        audit(db,c,u,'Pièce client enregistrée',customer_id);db.commit();return {'id':item['id'],'customerId':item['customerId']}
 
     @app.get('/api/v2/operations/documents/lookup')
     def lookup(number:str,token=Depends(auth),db=Depends(session)):
@@ -305,12 +335,19 @@ def install(app, env):
         if old:return old
         get(db,c.id,'ticket_routes',req.routeId)
         if date(req.expiresOn)<now().date():raise HTTPException(422,'Expiration passée')
-        item=put(db,c.id,'travel_packs',{**req.model_dump(),'remaining':req.journeys,'createdBy':u.id,'createdByName':u.name,'createdAt':now().isoformat(),'agency':u.agency,'redemptions':[]})
+        customer_id=resolve_customer(db,c.id,req)
+        item=put(db,c.id,'travel_packs',{**req.model_dump(),'customerId':customer_id,'remaining':req.journeys,'createdBy':u.id,'createdByName':u.name,'createdAt':now().isoformat(),'agency':u.agency,'redemptions':[]})
         audit(db,c,u,'Carnet prépayé vendu',req.id);db.commit();return item
 
     @app.post('/api/v2/operations/tickets/{ident}/transfer')
     def transfer(ident:str,req:TransferRequest,token=Depends(auth),db=Depends(session)):
-        c,u=access(db,token,'manager',True);t=get(db,c.id,'tickets',ident)
+        c,u=access(db,token,'manager',True)
+        try:t=get(db,c.id,'tickets',ident)
+        except HTTPException as exc:
+            if exc.status_code!=404:raise
+            t=next((p for p in rows(db,c.id,'tickets') if str(p.get('pnr') or '').upper()==ident.upper()),None)
+            if not t:raise HTTPException(404,'Billet introuvable : vérifiez le PNR')
+        ident=t['id']
         history=t.get('transfers',[])
         if any(x.get('id')==req.id for x in history):return t
         if t.get('status') in {'Annulé','Remboursé'} or t.get('boarded'):raise HTTPException(409,'Billet annulé, remboursé ou déjà embarqué')

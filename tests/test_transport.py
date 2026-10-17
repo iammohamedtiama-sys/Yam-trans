@@ -558,3 +558,28 @@ def test_central_tariff_also_protects_reservation_deposits(setup):
     data={"id":"reservation","tripId":"trip","seat":"A1","passengerName":"Client","phone":"70000002","amount":10000,"deposit":10000,"expiresAt":(datetime.now(timezone.utc)+timedelta(hours=2)).isoformat()}
     assert post(h,'/reservations',data).status_code==422
     assert post(h,'/reservations',{**data,'amount':5000,'deposit':2000}).status_code==200
+
+
+def test_customer_identity_and_pack_can_be_created_without_internal_ids(setup):
+    h,cid,_=setup;configure_route(cid)
+    doc={'id':'d','customerName':'Client lisible','phone':'70000001','kind':'CNIB','number':'B88888'}
+    created=ops(h,'/documents',doc)
+    assert created.status_code==200,created.text
+    customer_id=created.json()['customerId']
+    p={'id':'pack','customerName':'Client lisible','phone':'+22670000001','routeId':'route','journeys':10,'amount':45000,'expiresOn':(datetime.now(timezone.utc)+timedelta(days=90)).date().isoformat()}
+    pack=ops(h,'/packs',p)
+    assert pack.status_code==200,pack.text
+    assert pack.json()['customerId']==customer_id
+    renewed=ops(h,'/documents',{**doc,'id':'renewed','number':'A77777','kind':'Passeport','previousNumber':'B88888','phone':'70000002'})
+    assert renewed.status_code==200,renewed.text
+    assert renewed.json()['customerId']==customer_id
+    assert ops(h,'/documents/lookup?number=B88888',method='GET').status_code==404
+
+
+def test_transfer_accepts_the_visible_pnr_instead_of_database_id(setup):
+    h,cid,departure=setup
+    post(h,'/tickets/confirm',{'ticket':ticket()})
+    client.post('/api/v2/sync',headers=h,json={'deviceId':'test','entities':{'ticket_trips':[{'id':'new-trip','busId':'bus','origin':'Ouaga','destination':'Bobo','departureAt':departure,'status':'Publié'}]}})
+    result=ops(h,'/tickets/PNR-ticket/transfer',{'id':'move','tripId':'new-trip','seat':'A1','reason':'Départ modifié'})
+    assert result.status_code==200,result.text
+    assert result.json()['id']=='ticket' and result.json()['tripId']=='new-trip'

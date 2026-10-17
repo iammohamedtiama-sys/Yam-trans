@@ -1689,7 +1689,7 @@ window.__yamHandleNativeBack=()=>{
 };
 
 
-const operationsUi = createOperationsUi({state, shell, esc, money, uid, ticketRole, serverUrl:SERVER_URL, render, notify, syncNow, persist, markBoarded, openTicketActions, saveBlob:saveOrShareBlob, openTrip:id=>{navigatePage('ticketOperations');const select=document.querySelector('#transportTrip');if(select){select.value=id;select.dispatchEvent(new Event('change'))}}});
+const operationsUi = createOperationsUi({state, shell, esc, money, uid, ticketRole, serverUrl:SERVER_URL, render, notify, syncNow, persist, markBoarded, openTicketActions, saveBlob:saveOrShareBlob, customerByPhone:unifiedCustomerByPhone, openTrip:id=>{navigatePage('ticketOperations');const select=document.querySelector('#transportTrip');if(select){select.value=id;select.dispatchEvent(new Event('change'))}}});
 
 const transportUi=createTransportUi({state,esc,money,uid,now,persist,render,shell,notify,ticketRole,navigatePage,normalizePhone,serverUrl:SERVER_URL,sync:()=>syncNow(true),deviceId:()=>syncPayload().deviceId,pnr:ticketPnr,printTicket:printTicketNow,openTicket:openTicketActions,busSeats:seatsForBus,saveBlob:saveOrShareBlob});
 
