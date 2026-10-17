@@ -333,7 +333,12 @@ def install(app, env):
         c,u=access(db,token,'sales',True)
         old=retry(db,c,u,'travel_packs',req.id)
         if old:return old
-        get(db,c.id,'ticket_routes',req.routeId)
+        route=get(db,c.id,'ticket_routes',req.routeId)
+        manager=u.role in {'admin','company_admin','superuser'} or 'manager' in (u.modules or {}).get('ticketRoles',[])
+        if not manager:
+            tariff=route.get('fareVip' if req.seatClass=='VIP' else 'fareSimple')
+            if tariff in (None,'') or not math.isclose(req.amount,float(tariff)*req.journeys,abs_tol=0.001):
+                raise HTTPException(403,'Un responsable doit autoriser le tarif réduit du carnet; le guichet applique le tarif de ligne')
         if date(req.expiresOn)<now().date():raise HTTPException(422,'Expiration passée')
         customer_id=resolve_customer(db,c.id,req)
         item=put(db,c.id,'travel_packs',{**req.model_dump(),'customerId':customer_id,'remaining':req.journeys,'createdBy':u.id,'createdByName':u.name,'createdAt':now().isoformat(),'agency':u.agency,'redemptions':[]})

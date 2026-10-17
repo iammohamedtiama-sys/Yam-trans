@@ -583,3 +583,11 @@ def test_transfer_accepts_the_visible_pnr_instead_of_database_id(setup):
     result=ops(h,'/tickets/PNR-ticket/transfer',{'id':'move','tripId':'new-trip','seat':'A1','reason':'Départ modifié'})
     assert result.status_code==200,result.text
     assert result.json()['id']=='ticket' and result.json()['tripId']=='new-trip'
+
+
+def test_sales_cannot_bypass_fixed_tariffs_with_a_discounted_pack(setup):
+    h,cid,_=setup;configure_route(cid)
+    sales=user_headers(cid,'sales-test',['sales'])
+    p={'id':'pack','customerName':'Client','phone':'70000001','routeId':'route','journeys':10,'amount':1,'expiresOn':(datetime.now(timezone.utc)+timedelta(days=90)).date().isoformat()}
+    assert ops(sales,'/packs',p).status_code==403
+    assert ops(sales,'/packs',{**p,'amount':50000}).status_code==200
