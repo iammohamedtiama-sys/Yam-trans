@@ -101,3 +101,18 @@ def test_account_edit_changes_password_roles_and_can_deactivate(setup):
     assert client.get('/api/v2/admin/bootstrap',headers={'Authorization':'Bearer '+login.json()['token']}).status_code==401
     assert client.post('/api/v2/auth/login',json={'company':'YAMTRANS','username':username,'password':'after123'}).status_code==401
 
+
+
+def test_price_cannot_be_entered_freely_even_by_manager_on_legacy_trip(setup):
+    h,_,_=setup
+    assert post(h,'/tickets/confirm',{'ticket':ticket(fare=1,paid=1)}).status_code==422
+    assert post(h,'/tickets/confirm',{'ticket':ticket(fare=4000,paid=4000,discount=1000)}).status_code==403
+    assert post(h,'/tickets/confirm',{'ticket':ticket()}).status_code==200
+
+
+def test_discount_cannot_bypass_fixed_price_through_sync(setup):
+    h,_,_=setup
+    r=client.post('/api/v2/sync',headers=h,json={'deviceId':'test','entities':{'tickets':[ticket(fare=4000,paid=4000,discount=1000)]}})
+    assert r.status_code==200,r.text
+    assert any(c['type']=='discount_disabled' for c in r.json()['conflicts'])
+    assert not r.json()['entities'].get('tickets')

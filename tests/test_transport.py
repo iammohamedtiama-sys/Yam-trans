@@ -88,8 +88,8 @@ def test_hold_is_consumed_by_confirmation(setup):
 
 def test_batch_is_atomic_if_one_seat_is_taken(setup):
     h,_,_=setup
-    post(h,'/tickets/confirm',{"ticket":ticket('existing',seat='A2')})
-    result=post(h,'/bookings/confirm',{"bookingId":"group","tickets":[ticket('group-one'),ticket('group-two',seat='A2')]})
+    post(h,'/tickets/confirm',{"ticket":ticket('existing',seat='A2',fare=7000,paid=7000)})
+    result=post(h,'/bookings/confirm',{"bookingId":"group","tickets":[ticket('group-one'),ticket('group-two',seat='A2',fare=7000,paid=7000)]})
     assert result.status_code==409,result.text
     data=client.post('/api/v2/sync',headers=h,json={"deviceId":"test","entities":{}}).json()['entities']['tickets']
     assert [t['id'] for t in data]==['existing']
@@ -97,7 +97,7 @@ def test_batch_is_atomic_if_one_seat_is_taken(setup):
 
 def test_group_order_confirms_multiple_seats(setup):
     h,_,_=setup
-    result=post(h,'/bookings/confirm',{"bookingId":"group","tickets":[ticket('group-one'),ticket('group-two',seat='A2')]})
+    result=post(h,'/bookings/confirm',{"bookingId":"group","tickets":[ticket('group-one'),ticket('group-two',seat='A2',fare=7000,paid=7000)]})
     assert result.status_code==200,result.text
     assert len(result.json()['tickets'])==2
     assert {t['bookingGroupId'] for t in result.json()['tickets']}=={'group'}

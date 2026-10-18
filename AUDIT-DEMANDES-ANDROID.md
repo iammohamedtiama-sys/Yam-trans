@@ -1,3 +1,15 @@
+# Correctif Android 4.8.2
+
+- Caméra Android ouverte explicitement avec autorisation ; import via les images du téléphone séparé de la prise de vue.
+- Lecture OCR embarquée dans l’APK pour la vente, l’embarquement et l’écran Identité client. La lecture ne dépend plus du serveur sur Android. Numéro proposé automatiquement, nom prérempli lorsqu’il est identifié et que le champ est vide ; vérification humaine conservée.
+- Tarif présenté comme un montant calculé, sans champ de saisie visible ; remise retirée. Le serveur refuse les nouvelles ventes remisées et les tarifs divergents, y compris pour les départs historiques.
+- Point d’embarquement fixé au départ ; seule la descente reste sélectionnable sur les lignes à escales.
+- Connexion hors ligne liée au jeton du compte mis en cache. Ancienne session plateforme supprimée à la déconnexion et à la connexion normale ; identité du compte affichée dans l’en-tête.
+- Même clé de développement que l’APK 4.8.1. La recette sur téléphone physique reste à faire pour la caméra, les images réelles et l’impression.
+- Les nouveaux parcours d’enregistrement CNIB et d’embarquement exigent encore la mise à jour du serveur. L’embarquement n’est pas une simple reconnaissance visuelle automatique : l’agent vérifie la pièce et confirme le voyage.
+
+## Historique et autres demandes
+
 # YamTrans — reprise des demandes Android
 
 ## Correction 4.8.1

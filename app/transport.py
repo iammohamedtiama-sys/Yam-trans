@@ -76,7 +76,7 @@ def route_fare(route, trip, payload, seat_class):
             return float(match[4 if seat_class == "VIP" else 3])
     adult = "fareVip" if seat_class == "VIP" else "fareSimple"
     key = ("fareChildVip" if seat_class == "VIP" else "fareChildSimple") if payload.get("passengerCategory") == "child" else adult
-    value = route.get(key, route.get(adult))
+    value = route.get(key, route.get(adult, trip.get(key, trip.get(adult))))
     if value is None or value == "":
         return None
     try:
@@ -259,6 +259,8 @@ def install(app, env):
             raise HTTPException(422, "Siège absent du plan du bus")
         route_row = db.get(Entity, {"company_id":cid,"entity_type":"ticket_routes","entity_id":str(tr.get("routeId") or "")})
         base = route_fare(route_row.payload if route_row and not route_row.deleted else {}, tr, payload, seat.get("class") or "Simple")
+        if base is None:
+            raise HTTPException(422,"Tarif non configuré : le responsable doit renseigner la grille avant la vente")
         if base is not None:
             discount = float(payload.get("discount") or 0)
             if discount < 0 or discount > base or (discount and not manager):
@@ -403,6 +405,8 @@ def install(app, env):
             if not math.isfinite(val) or val < 0:
                 raise HTTPException(422, "Montant invalide")
             t[field] = val
+        if t["discount"]:
+            raise HTTPException(403,"Les remises sont désactivées au guichet : utilisez le tarif de la ligne")
         validate_tariff(db, c.id, t, u.role in {"company_admin","superuser","admin"} or "manager" in (u.modules or {}).get("ticketRoles", []))
         if t["paid"] > t["fare"]:
             raise HTTPException(422, "Le paiement dépasse le tarif")

@@ -13,3 +13,5 @@ input[readonly]{background:#f1f5f9;color:#334155}
 .ticket-counter-sale label[hidden]{display:none!important}
 
 .identity-sale-card{padding:18px;margin:16px 0;border:1px solid #bbd9cf;border-radius:16px;background:#f4faf7;display:grid;gap:12px}.identity-sale-card p{margin:4px 0;color:#52675f}.identity-sale-card .file-button{width:fit-content}.identity-sale-card .ops-document-photo{max-width:100%;max-height:220px;object-fit:contain;border-radius:10px}.identity-sale-card [hidden]{display:none!important}.ops-identity-result{display:grid;gap:7px;padding:14px;border:1px solid #dce6e1;border-radius:12px;margin:10px 0}
+
+.sale-fare-summary{display:grid;gap:8px;border:1px solid #b8d5c8;border-radius:12px;padding:14px;background:#eef8f1}.sale-fare-summary span{font-size:13px;color:#456252}.sale-fare-summary output{font-size:22px;font-weight:800;color:#075f4e}.signed-in-user{font-size:12px;max-width:220px;white-space:normal;color:#355547}@media(max-width:600px){.signed-in-user{width:100%;max-width:none}}

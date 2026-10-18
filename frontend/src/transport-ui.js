@@ -107,7 +107,7 @@ export function createTransportUi(ctx) {
       let amount=0,count=0;
       for(const row of travelers.children)for(const [field,trip] of [['outSeat',tr],['backSeat',ret()]]){
         if(!trip)continue;const seat=seats(trip).find(s=>String(s.label)===row.querySelector('[name="'+field+'"]').value);
-        if(seat){amount+=Number(seat.class==='VIP'?trip.fareVip||0:trip.fareSimple||0);count++;}
+        if(seat){amount+=segmentFare(state.ticketRoutes.find(r=>r.id===trip.routeId),trip,trip.origin,trip.destination,seat.class);count++;}
       }
       f.querySelector('#groupTotal').textContent=count+' billet(s) · total à encaisser : '+money(amount);
     };
@@ -129,7 +129,7 @@ export function createTransportUi(ctx) {
           if(!trip)continue;
           const seat=seats(trip).find(s=>String(s.label)===row.querySelector('[name="'+field+'"]').value);
           if(!seat)throw new Error('Choisissez tous les sièges');
-          const fare=Number(seat.class==='VIP'?trip.fareVip||0:trip.fareSimple||0);
+          const fare=segmentFare(state.ticketRoutes.find(r=>r.id===trip.routeId),trip,trip.origin,trip.destination,seat.class);
           items.push({id:uid(),pnr:ctx.pnr(),publicToken:uid(),tripId:trip.id,passengerName,phone,seat:seat.label,seatClass:seat.class,boardingPoint:trip.origin,dropPoint:trip.destination,fare,paid:fare,discount:0,paymentMethod:f.elements.paymentMethod.value});
         }
       }

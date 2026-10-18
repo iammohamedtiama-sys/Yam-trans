@@ -109,7 +109,7 @@ with engine.begin() as conn:
     except Exception:
         try: conn.execute(text("ALTER TABLE app_users_v3 ADD COLUMN modules JSON"))
         except Exception: pass
-app = FastAPI(title="YAM TRANS Multi-Sociétés · Courrier & Billetterie", version="4.8.1")
+app = FastAPI(title="YAM TRANS Multi-Sociétés · Courrier & Billetterie", version="4.8.2")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -548,7 +548,7 @@ def agency_public_info(db: Session, company_id: str, name: str) -> dict[str, str
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "transport-multitenant-sync", "version": "4.8.1", "time": utcnow().isoformat()}
+    return {"status": "ok", "service": "transport-multitenant-sync", "version": "4.8.2", "time": utcnow().isoformat()}
 
 
 @app.post("/api/v2/auth/login")
@@ -797,6 +797,9 @@ def sync_v2(req: SyncRequest, token: dict[str, Any] = Depends(read_token), db: S
                 except HTTPException as exc:
                     conflicts.append({"type":"crew_invalid","entityType":entity_type,"id":entity_id,"message":str(exc.detail)})
                     continue
+            if entity_type == "tickets" and current is None and _num(payload.get("discount")) != 0:
+                conflicts.append({"type":"discount_disabled","entityType":entity_type,"id":entity_id,"message":"Les remises sont désactivées au guichet"})
+                continue
             if entity_type == "tickets" and payload.get("packId") and current is None:
                 conflicts.append({"type":"prepaid_online_required","entityType":entity_type,"id":entity_id,"message":"Un carnet doit être débité par la confirmation serveur"})
                 continue
@@ -1510,7 +1513,7 @@ def tracking_page(company: str = Query(default=DEFAULT_COMPANY_CODE), code: str 
 
 @app.get("/")
 def root():
-    return {"service": "Transport Multi-Sociétés", "version": "4.8.1", "health": f"{PUBLIC_BASE_URL}/health", "tracking": f"{PUBLIC_BASE_URL}/suivi?company={DEFAULT_COMPANY_CODE}&code=OUA-00001"}
+    return {"service": "Transport Multi-Sociétés", "version": "4.8.2", "health": f"{PUBLIC_BASE_URL}/health", "tracking": f"{PUBLIC_BASE_URL}/suivi?company={DEFAULT_COMPANY_CODE}&code=OUA-00001"}
 
 
 # Interface web complète : le même client que l'application Android, avec les mêmes rôles.
