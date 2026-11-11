@@ -151,3 +151,10 @@ def test_concurrent_payroll_payments_record_one_expense(setup):
     assert sorted(codes)==[200,409]
     with m.SessionLocal() as db:
         rows=db.scalars(m.select(m.EntityV3).where(m.EntityV3.company_id==cid,m.EntityV3.entity_type=='expenses')).all();assert len([r for r in rows if r.payload.get('payrollId')==p['id']])==1
+
+
+def test_disabled_module_overrides_checked_actions(setup):
+    h,cid,_=setup;staff,ident=employee(cid,'counter')
+    with m.SessionLocal() as db:
+        u=db.get(m.AppUser,ident);u.modules={**u.modules,'tickets':False};db.commit()
+    assert post(staff,'/tickets/confirm',{'ticket':ticket()}).status_code==403

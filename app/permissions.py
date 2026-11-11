@@ -32,7 +32,10 @@ PROFILES={
 def allowed(user, action):
     if action not in CATALOG:return False
     mods=user.modules or {};overrides=mods.get('permissions')
-    if isinstance(overrides,dict):return overrides.get(action) is True
+    if isinstance(overrides,dict):
+        module='courier' if action.startswith('courier.') else 'baggage' if action.startswith('baggage.') else 'tickets' if action.startswith(('tickets.','trips.','gps.','identity.','fleet.','stock.','charters.','parking.')) else None
+        if module and not mods.get(module,module!='tickets'):return False
+        return overrides.get(action) is True
     if user.role in {'admin','company_admin','superuser'}:return True
     if mods.get('profile') in PROFILES:return action in PROFILES[mods['profile']]['actions']
     roles=set(mods.get('ticketRoles') or [])

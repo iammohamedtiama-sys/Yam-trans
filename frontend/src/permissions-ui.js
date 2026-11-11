@@ -3,7 +3,7 @@ export { catalog };
 export function canAction(state,action){
  const user=(state.users||[]).find(u=>u.id===state.user?.id)||state.user;if(!user)return false;
  const m=user.modules||{};
- if(m.permissions&&typeof m.permissions==='object')return m.permissions[action]===true;
+ if(m.permissions&&typeof m.permissions==='object'){const module=action.startsWith('courier.')?'courier':action.startsWith('baggage.')?'baggage':['tickets.','trips.','gps.','identity.','fleet.','stock.','charters.','parking.'].some(p=>action.startsWith(p))?'tickets':null;if(module&&m[module]===false)return false;return m.permissions[action]===true;}
  if(['admin','company_admin','superuser'].includes(user.role))return true;
  if(catalog.profiles[m.profile])return catalog.profiles[m.profile].actions.includes(action);
  const r=m.ticketRoles||[];if(r.includes('manager'))return true;
