@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import Boolean, DateTime, Integer, JSON, String, Text, UniqueConstraint, create_engine, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 from .operations import install as install_operations
+from .extensions import install as install_extensions
 from .transport import install as install_transport, lock_company, READ_ONLY_TYPES, active as transport_active
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./yamtrans-sync.db")
@@ -109,7 +110,7 @@ with engine.begin() as conn:
     except Exception:
         try: conn.execute(text("ALTER TABLE app_users_v3 ADD COLUMN modules JSON"))
         except Exception: pass
-app = FastAPI(title="YAM TRANS Multi-Sociétés · Courrier & Billetterie", version="4.8.2")
+app = FastAPI(title="YAM TRANS Multi-Sociétés · Courrier & Billetterie", version="4.9.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -548,7 +549,7 @@ def agency_public_info(db: Session, company_id: str, name: str) -> dict[str, str
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "transport-multitenant-sync", "version": "4.8.2", "time": utcnow().isoformat()}
+    return {"status": "ok", "service": "transport-multitenant-sync", "version": "4.9.0", "time": utcnow().isoformat()}
 
 
 @app.post("/api/v2/auth/login")
@@ -797,6 +798,19 @@ def sync_v2(req: SyncRequest, token: dict[str, Any] = Depends(read_token), db: S
                 except HTTPException as exc:
                     conflicts.append({"type":"crew_invalid","entityType":entity_type,"id":entity_id,"message":str(exc.detail)})
                     continue
+            if entity_type == 'ticket_trips' and payload.get('busId') and payload.get('status') not in {'Annulé','Terminé','Arrivé','Clôturé'}:
+                previous_trip = dict(current.payload or {}) if current else {}
+                if current is None or any(payload.get(k) != previous_trip.get(k) for k in ('busId','departureAt','expectedArrivalAt','durationMinutes')):
+                    try:
+                        from .extensions import legacy_trip_time
+                        start = legacy_trip_time(payload.get('departureAt'))
+                        end = legacy_trip_time(payload['expectedArrivalAt']) if payload.get('expectedArrivalAt') else start + timedelta(minutes=int(payload.get('durationMinutes') or 240))
+                        if end <= start:
+                            raise HTTPException(422, 'La fin du voyage doit suivre le départ')
+                        check_vehicle_availability(db, company.id, payload['busId'], start, end, entity_id)
+                    except (HTTPException, ValueError, TypeError) as exc:
+                        conflicts.append({'type':'vehicle_conflict','entityType':entity_type,'id':entity_id,'message':str(exc.detail) if isinstance(exc,HTTPException) else 'Durée de voyage invalide'})
+                        continue
             if entity_type == "tickets" and current is None and _num(payload.get("discount")) != 0:
                 conflicts.append({"type":"discount_disabled","entityType":entity_type,"id":entity_id,"message":"Les remises sont désactivées au guichet"})
                 continue
@@ -1513,7 +1527,7 @@ def tracking_page(company: str = Query(default=DEFAULT_COMPANY_CODE), code: str 
 
 @app.get("/")
 def root():
-    return {"service": "Transport Multi-Sociétés", "version": "4.8.2", "health": f"{PUBLIC_BASE_URL}/health", "tracking": f"{PUBLIC_BASE_URL}/suivi?company={DEFAULT_COMPANY_CODE}&code=OUA-00001"}
+    return {"service": "Transport Multi-Sociétés", "version": "4.9.0", "health": f"{PUBLIC_BASE_URL}/health", "tracking": f"{PUBLIC_BASE_URL}/suivi?company={DEFAULT_COMPANY_CODE}&code=OUA-00001"}
 
 
 # Interface web complète : le même client que l'application Android, avec les mêmes rôles.
@@ -1546,3 +1560,4 @@ if os.path.isdir(WEBAPP_DIR):
 # Additive transport APIs; existing entities and routes remain available.
 install_transport(app, globals())
 install_operations(app, globals())
+install_extensions(app, globals())

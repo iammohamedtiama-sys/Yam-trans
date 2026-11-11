@@ -21,6 +21,7 @@ class ParkingRequest(BaseModel):
     condition: str = Field(min_length=1, max_length=1000)
     rate: float = Field(ge=0, allow_inf_nan=False)
     pricing: Literal['jour', 'forfait']
+    slotId: str = ''
 
 class ReleaseRequest(BaseModel):
     paid: float = Field(ge=0, allow_inf_nan=False)
@@ -185,6 +186,7 @@ def install(app, env):
         if manager or 'sales' in roles:
             result['travel_packs']=rows(db,c.id,'travel_packs')
             result['parking']=rows(db,c.id,'parking')
+            result['parking_slots']=rows(db,c.id,'parking_slots')
         if manager or 'dispatch' in roles:
             result.update({k:rows(db,c.id,k) for k in ('parking','fleet_events','tracking_events','trip_shares')})
         return result
@@ -196,7 +198,8 @@ def install(app, env):
         if old:return old
         if any(p.get('status')=='Déposé' and p.get('registration','').strip().upper()==req.registration.strip().upper() for p in rows(db,c.id,'parking')):
             raise HTTPException(409,'Ce véhicule est déjà consigné')
-        item=put(db,c.id,'parking',{**req.model_dump(),'status':'Déposé','depositedAt':now().isoformat(),'createdBy':u.id,'createdByName':u.name,'agency':u.agency})
+        payload=env['check_parking_slot'](db,c,req.model_dump()) if 'check_parking_slot' in env else req.model_dump()
+        item=put(db,c.id,'parking',{**payload,'status':'Déposé','depositedAt':now().isoformat(),'createdBy':u.id,'createdByName':u.name,'agency':u.agency})
         audit(db,c,u,'Véhicule consigné',req.registration);db.commit();return item
 
     @app.post('/api/v2/operations/parking/{ident}/release')
@@ -254,6 +257,8 @@ def install(app, env):
         if (req.latitude is None)!=(req.longitude is None) or (req.stage=='Position' and req.latitude is None):
             raise HTTPException(422,'Position GPS complète requise')
         item=put(db,c.id,'tracking_events',{**req.model_dump(),'tripId':ident,'createdAt':now().isoformat(),'createdBy':u.id})
+        if 'queue_trip_notifications' in env:
+            env['queue_trip_notifications'](db,c,u,tr,item)
         if req.stage in {'Parti','Arrivé','Embarquement'}:
             put(db,c.id,'ticket_trips',{**tr,'status':req.stage,'actualArrivalAt':item['createdAt']} if req.stage=='Arrivé' else {**tr,'status':req.stage})
         db.commit();return item

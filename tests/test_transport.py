@@ -415,7 +415,7 @@ def test_pack_cannot_be_redeemed_for_other_customer_or_sync(setup):
 def test_transfer_preserves_cash_releases_original_seat_and_retries(setup):
     h,cid,departure=setup
     post(h,'/tickets/confirm',{'ticket':ticket()})
-    r=client.post('/api/v2/sync',headers=h,json={'deviceId':'test','entities':{'ticket_trips':[{'id':'new-trip','busId':'bus','origin':'Ouaga','destination':'Bobo','departureAt':departure,'status':'Publié'}]}})
+    r=client.post('/api/v2/sync',headers=h,json={'deviceId':'test','entities':{'ticket_trips':[{'id':'new-trip','busId':'bus','origin':'Ouaga','destination':'Bobo','departureAt':(datetime.fromisoformat(departure)+timedelta(days=1)).isoformat(),'status':'Publié'}]}})
     assert r.status_code==200
     p={'id':'transfer','tripId':'new-trip','seat':'A1','reason':'Voyageur change de départ'}
     one=ops(h,'/tickets/ticket/transfer',p);two=ops(h,'/tickets/ticket/transfer',p)
@@ -579,7 +579,7 @@ def test_customer_identity_and_pack_can_be_created_without_internal_ids(setup):
 def test_transfer_accepts_the_visible_pnr_instead_of_database_id(setup):
     h,cid,departure=setup
     post(h,'/tickets/confirm',{'ticket':ticket()})
-    client.post('/api/v2/sync',headers=h,json={'deviceId':'test','entities':{'ticket_trips':[{'id':'new-trip','busId':'bus','origin':'Ouaga','destination':'Bobo','departureAt':departure,'status':'Publié'}]}})
+    client.post('/api/v2/sync',headers=h,json={'deviceId':'test','entities':{'ticket_trips':[{'id':'new-trip','busId':'bus','origin':'Ouaga','destination':'Bobo','departureAt':(datetime.fromisoformat(departure)+timedelta(days=1)).isoformat(),'status':'Publié'}]}})
     result=ops(h,'/tickets/PNR-ticket/transfer',{'id':'move','tripId':'new-trip','seat':'A1','reason':'Départ modifié'})
     assert result.status_code==200,result.text
     assert result.json()['id']=='ticket' and result.json()['tripId']=='new-trip'

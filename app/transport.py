@@ -595,6 +595,11 @@ def install(app, env):
         c,u=access(db,token,"dispatch",True)
         tr=get(db,c.id,"ticket_trips",trip_id)
         bus=get(db,c.id,"ticket_buses",req.busId)
+        if 'check_vehicle_availability' in env:
+            from .extensions import legacy_trip_time
+            start=legacy_trip_time(tr['departureAt'])
+            end=legacy_trip_time(tr['expectedArrivalAt']) if tr.get('expectedArrivalAt') else start+timedelta(minutes=int(tr.get('durationMinutes') or 240))
+            env['check_vehicle_availability'](db,c.id,req.busId,start,end,trip_id)
         if tr.get("status") in {"Annulé","Terminé","Arrivé"} or bus.get("active") is False or bus.get("status") in {"En panne","Maintenance","Indisponible"}:
             raise HTTPException(409,"Départ ou bus indisponible")
         labels={str(s.get("label")):s for s in bus_seats(bus)}
@@ -635,6 +640,11 @@ def install(app, env):
             if existing:
                 result.append(existing.payload)
                 continue
+            if 'check_vehicle_availability' in env:
+                from .extensions import legacy_trip_time
+                aware=legacy_trip_time(at.isoformat())
+                end=aware+timedelta(minutes=int(tr.get('durationMinutes') or 240))
+                env['check_vehicle_availability'](db,c.id,tr['busId'],aware,end)
             # Explicit allowlist prevents copying arrival/manifest/dispatch state.
             copy={k:tr[k] for k in ("routeId","busId","origin","destination","stops","boardingPoint","dropPoint","fareSimple","fareVip","fareChildSimple","fareChildVip","capacityOverride","driver","conductor","driverId","conductorId","cargoCapacityKg","cargoCapacityCount") if k in tr}
             result.append(put(db,c.id,"ticket_trips",{**copy,"id":ident,"departureAt":at.isoformat(),"status":"Planifié","repeatSourceId":trip_id,"createdAt":now().isoformat(),"createdBy":u.id}))
