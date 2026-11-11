@@ -9,6 +9,7 @@ import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+from types import SimpleNamespace
 from urllib.parse import quote_plus
 from urllib import request as urlrequest, error as urlerror
 
@@ -111,7 +112,7 @@ with engine.begin() as conn:
     except Exception:
         try: conn.execute(text("ALTER TABLE app_users_v3 ADD COLUMN modules JSON"))
         except Exception: pass
-app = FastAPI(title="YAM TRANS Multi-Sociétés · Courrier & Billetterie", version="4.10.0")
+app = FastAPI(title="YAM TRANS Multi-Sociétés · Courrier & Billetterie", version="4.10.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -407,6 +408,22 @@ def require_company(token: dict[str, Any], db: Session) -> Company:
     return company
 
 
+def resolve_company_user(token: dict[str, Any], db: Session):
+    """Resolve the operational actor after validating the live account and tenant."""
+    company = require_company(token, db)
+    uid = str(token.get("uid") or "")
+    if uid.startswith("platform:"):
+        # require_company verifies the real platform administrator, its active
+        # state and the company encoded in this delegated session on every call.
+        return company, SimpleNamespace(
+            id=uid, company_id=company.id, username="platform-admin",
+            name="Super Admin Plateforme", role="company_admin", agency="Toutes",
+            active=True, modules={"courier": True, "tickets": True,
+                "ticketRoles": ["sales", "boarding", "dispatch", "driver", "reports", "manager"]},
+        )
+    return company, db.get(AppUser, uid)
+
+
 def entity_id_for(payload: dict[str, Any]) -> str:
     return str(payload.get("id") or payload.get("phone") or payload.get("code") or "").strip()
 
@@ -550,7 +567,7 @@ def agency_public_info(db: Session, company_id: str, name: str) -> dict[str, str
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "transport-multitenant-sync", "version": "4.10.0", "time": utcnow().isoformat()}
+    return {"status": "ok", "service": "transport-multitenant-sync", "version": "4.10.1", "time": utcnow().isoformat()}
 
 
 @app.post("/api/v2/auth/login")
@@ -1532,7 +1549,7 @@ def tracking_page(company: str = Query(default=DEFAULT_COMPANY_CODE), code: str 
 
 @app.get("/")
 def root():
-    return {"service": "Transport Multi-Sociétés", "version": "4.10.0", "health": f"{PUBLIC_BASE_URL}/health", "tracking": f"{PUBLIC_BASE_URL}/suivi?company={DEFAULT_COMPANY_CODE}&code=OUA-00001"}
+    return {"service": "Transport Multi-Sociétés", "version": "4.10.1", "health": f"{PUBLIC_BASE_URL}/health", "tracking": f"{PUBLIC_BASE_URL}/suivi?company={DEFAULT_COMPANY_CODE}&code=OUA-00001"}
 
 
 # Interface web complète : le même client que l'application Android, avec les mêmes rôles.

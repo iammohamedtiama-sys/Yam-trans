@@ -188,10 +188,7 @@ def install(app, env):
     def access(db, token, role, write=False):
         if write:
             lock_company(db, Company, token.get("cid"))
-        c = env["require_company"](token, db)
-        u = db.get(User, token.get("uid"))
-        if not u or not u.active or u.company_id != c.id:
-            raise HTTPException(403, "Compte société actif requis")
+        c, u = env["resolve_company_user"](token, db)
         if not (c.settings or {}).get("modules", {}).get("tickets", False):
             raise HTTPException(403, "Module Tickets non activé")
         manager = u.role in {"company_admin", "superuser", "admin"}

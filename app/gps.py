@@ -56,8 +56,7 @@ def install(app, env):
 
     def access(db,token,write=False,manage=False):
         if write:lock_company(db,Company,token.get('cid'))
-        c=env['require_company'](token,db);u=db.get(User,token.get('uid'))
-        if not u or not u.active or u.company_id!=c.id:raise HTTPException(403,'Compte société actif requis')
+        c,u=env['resolve_company_user'](token,db)
         roles=set((u.modules or {}).get('ticketRoles',[]));manager=u.role in {'admin','company_admin','superuser'} or 'manager' in roles
         if not (c.settings or {}).get('modules',{}).get('tickets') or (not manager and (not (u.modules or {}).get('tickets') or not roles & {'dispatch','driver','reports'})) or (manage and not manager):
             raise HTTPException(403,'Droit de suivi GPS insuffisant')
