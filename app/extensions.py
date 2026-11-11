@@ -451,6 +451,7 @@ def install(app, env):
         for items in entities.values():
             for item in items:
                 item.pop('requestHash', None)
+                item.pop('tokenHash', None)
         return {'format': 'yamtrans-company-export', 'version': 1, 'exportedAt': now().isoformat(),
                 'company': {'id': c.id, 'code': c.code, 'name': c.name}, 'entities': entities,
                 'restore': 'Restauration administrateur sur une base de test avant remise en production'}

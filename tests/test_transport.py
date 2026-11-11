@@ -17,6 +17,14 @@ m = importlib.import_module("app.main")
 client = TestClient(m.app)
 
 
+def identity_photo():
+    import base64
+    from io import BytesIO
+    from PIL import Image
+    out=BytesIO();Image.new('RGB',(60,40),'white').save(out,format='PNG')
+    return 'data:image/png;base64,'+base64.b64encode(out.getvalue()).decode()
+
+
 @pytest.fixture()
 def setup():
     with m.SessionLocal() as db:
@@ -241,8 +249,10 @@ def test_boarding_update_after_departure_preserves_existing_ticket(setup):
     t=post(h,'/tickets/confirm',{"ticket":ticket()}).json()['ticket']
     with m.SessionLocal() as db:
         row=db.get(m.EntityV3,{"company_id":cid,"entity_type":"ticket_trips","entity_id":"trip"})
-        row.payload={**row.payload,"departureAt":(m.utcnow()-timedelta(hours=6)).isoformat(),"status":"Parti"};db.commit()
-    result=client.post('/api/v2/sync',headers=h,json={"deviceId":"test","entities":{"tickets":[{**t,"boarded":True}]}}).json()
+        row.payload={**row.payload,"departureAt":m.utcnow().replace(hour=0,minute=0,second=0,microsecond=0).isoformat(),"status":"Parti"};db.commit()
+    confirmed=post(h,'/tickets/ticket/board',{'tripId':'trip'})
+    assert confirmed.status_code==200,confirmed.text
+    result=client.post('/api/v2/sync',headers=h,json={"deviceId":"test","entities":{"tickets":[confirmed.json()['ticket']]}}).json()
     assert not result['conflicts']
     assert result['entities']['tickets'][0]['boarded'] is True
 
@@ -350,7 +360,7 @@ def test_fleet_retry_creates_one_expense_in_profitability(setup):
 
 def test_public_tracking_has_real_timestamp_and_no_passenger_data(setup):
     h,_,_=setup
-    post(h,'/tickets/confirm',{'ticket':ticket(documentNumber='SECRET-ID')})
+    assert post(h,'/tickets/confirm',{'ticket':ticket(documentNumber='B98765'),'document':{'kind':'CNIB','number':'B98765','photo':identity_photo()}}).status_code==200
     share=ops(h,'/trips/trip/share',{}).json();token=share['url'].split('/')[-1]
     event=ops(h,'/trips/trip/tracking',{'id':'position','stage':'Position','latitude':12.3,'longitude':-1.5,'accuracy':20})
     assert event.status_code==200,event.text
@@ -373,7 +383,7 @@ def test_tracking_rejects_incomplete_or_fake_coordinates(setup):
 
 def test_identity_renewal_preserves_customer_and_no_public_document(setup):
     h,_,_=setup
-    p={'id':'doc','customerId':'customer','customerName':'Client','phone':'70000001','kind':'CNIB','number':'B 1234'}
+    p={'id':'doc','customerId':'customer','customerName':'Client','phone':'70000001','kind':'CNIB','number':'B 1234','photo':identity_photo()}
     assert ops(h,'/documents',p).status_code==200
     t=post(h,'/tickets/confirm',{'ticket':ticket(documentNumber='B1234')}).json()['ticket']
     assert t['customerId']=='customer'
@@ -494,7 +504,7 @@ def test_ai_sends_aggregates_without_customer_or_employee_identity(setup,monkeyp
     import json
     from app import analysis_ai
     h,_,_=setup
-    post(h,'/tickets/confirm',{'ticket':ticket(passengerName='PRIVATE-NAME',documentNumber='PRIVATE-DOC')})
+    assert post(h,'/tickets/confirm',{'ticket':ticket(passengerName='PRIVATE-NAME',documentNumber='B87654'),'document':{'kind':'CNIB','number':'B87654','photo':identity_photo()}}).status_code==200
     monkeypatch.setenv('YAMTRANS_AI_API_KEY','test-key');monkeypatch.setenv('YAMTRANS_AI_MODEL','test-model')
     seen=[]
     class Response:
@@ -562,7 +572,7 @@ def test_central_tariff_also_protects_reservation_deposits(setup):
 
 def test_customer_identity_and_pack_can_be_created_without_internal_ids(setup):
     h,cid,_=setup;configure_route(cid)
-    doc={'id':'d','customerName':'Client lisible','phone':'70000001','kind':'CNIB','number':'B88888'}
+    doc={'id':'d','customerName':'Client lisible','phone':'70000001','kind':'CNIB','number':'B88888','photo':identity_photo()}
     created=ops(h,'/documents',doc)
     assert created.status_code==200,created.text
     customer_id=created.json()['customerId']

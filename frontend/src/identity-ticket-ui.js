@@ -1,12 +1,15 @@
-import { readIdentityDocument, nativeIdentityAvailable } from './document-reader.js';
+import { documentNumberKind } from './identity-text.js';
+import { readIdentityDocument } from './document-reader.js';
 // Identity photos stay in memory until the server saves the sale atomically.
 export function createIdentityTicketUi(ctx) {
   const {state, esc, notify, render, api} = ctx;
   let saleForm=null, photo='', reading=false, generation=0,tenant='';
-  const normalized=s=>String(s||'').toUpperCase().replace(/\s/g,'');
+  const normalized=s=>String(s||'').toUpperCase().replace(/[\s-]/g,'');
   let captureSerial=0;
-  async function capture(input,status,candidates,preview,onNumber,onPhoto,source='file',onFields=()=>{}) {
-    const file=input.files?.[0];if(source==='file'&&!file)return;
+  async function capture(input,status,candidates,preview,onNumber,onPhoto,source='camera',onFields=()=>{}) {
+    if(status.dataset.reading==='1')return;
+    status.dataset.reading='1';if(input?.tagName==='BUTTON'){input.disabled=true;input.setAttribute('aria-busy','true');}
+    const file=input?.files?.[0];
     const key=state.company?.id+':'+state.user?.id,page=state.page,serial=++captureSerial;
     const valid=()=>serial===captureSerial&&key===state.company?.id+':'+state.user?.id&&state.page===page;
     const fresh=el=>document.getElementById(el.id)||el;
@@ -19,7 +22,8 @@ export function createIdentityTicketUi(ctx) {
       onFields(result);
       for(const number of result.candidates||[]){const b=document.createElement('button');b.type='button';b.textContent=number;b.onclick=()=>onNumber(number);candidates.append(b);}
       status.textContent=result.warning||(result.primaryNumber?'Numéro proposé automatiquement. Vérifiez le numéro et le nom sur la pièce puis confirmez.':'Aucun numéro lisible. Photographiez la pièce entière, nette et sans reflet, ou saisissez le numéro.');
-    } catch(e) {if(valid()&&e.code!=='CANCELLED')fresh(status).textContent=e.message;}
+    } catch(e) {if(valid())fresh(status).textContent=e.message;}
+    finally{delete status.dataset.reading;if(input?.isConnected){input.disabled=false;input.removeAttribute('aria-busy');}}
   }
   function bindSale() {
     const f=document.querySelector('#ticketSaleForm');
@@ -29,21 +33,19 @@ export function createIdentityTicketUi(ctx) {
     const ref=f.elements.documentNumber?.closest('label');if(!ref)return;
     ref.innerHTML='Numéro de CNIB / passeport<input name="documentNumber" maxlength="100" autocomplete="off">';
     const box=document.createElement('section');box.className='identity-sale-card';
-    box.innerHTML=`<div><b>Voyager avec sa CNIB</b><p>Photographiez la pièce à l’achat. Le voyageur pourra la présenter à l’embarquement pour retrouver son billet.</p></div><div class="grid"><label>Type de pièce<select name="documentKind"><option>CNIB</option><option>Passeport</option><option>Autre</option></select></label><label>Expiration de la pièce<input name="documentExpiresOn" type="date"></label></div><div class="button-row"><button type="button" id="saleNativeCamera">Prendre une photo</button><button type="button" id="saleNativeGallery">Importer une image</button></div><label class="file-button" id="saleWebPhoto">Importer une image<input id="saleIdentityPhoto" type="file" accept="image/png,image/jpeg,image/webp"></label><img hidden class="ops-document-photo" id="saleIdentityPreview" alt="Pièce à vérifier"><p id="saleIdentityStatus" role="status"></p><div id="saleIdentityCandidates" class="button-row"></div><label><input type="checkbox" id="saleIdentityConfirmed" name="documentConfirmed"> J’ai vérifié le numéro, le nom et la photo sur la pièce</label><button type="button" id="saleIdentityClear">Retirer la pièce</button>`;
+    box.innerHTML=`<div><b>Voyager avec sa pièce d’identité</b><p>Prenez la photo de la CNIB (B…) ou du passeport (A…). La pièce permet ensuite de retrouver le billet à l’embarquement.</p></div><div class="grid"><label>Type de pièce<select name="documentKind"><option>CNIB</option><option>Passeport</option></select></label><label>Expiration de la pièce<input name="documentExpiresOn" type="date"></label></div><div class="button-row"><button type="button" id="saleNativeCamera">Prendre une photo</button></div><img hidden class="ops-document-photo" id="saleIdentityPreview" alt="Pièce à vérifier"><p id="saleIdentityStatus" role="status"></p><div id="saleIdentityCandidates" class="button-row"></div><label><input type="checkbox" id="saleIdentityConfirmed" name="documentConfirmed"> J’ai vérifié le numéro, le nom et la photo sur la pièce</label><button type="button" id="saleIdentityClear">Retirer la pièce</button>`;
     ref.parentElement.insertAdjacentElement('afterend',box);
     const status=box.querySelector('#saleIdentityStatus'),preview=box.querySelector('img'),confirmed=box.querySelector('#saleIdentityConfirmed');
     if(photo){preview.src=photo;preview.hidden=false;status.textContent='Photo prête à être associée au billet.';}
     const invalidate=()=>{confirmed.checked=false;};
     f.elements.documentNumber.addEventListener('input',invalidate);f.elements.passengerName.addEventListener('input',invalidate);f.elements.phone.addEventListener('input',invalidate);
-    const read=async(input,source='file')=>{
+    const read=async(input,source='camera')=>{
       if(reading)return;reading=true;confirmed.checked=false;
       try{await capture(input,status,box.querySelector('#saleIdentityCandidates'),preview,number=>{const form=document.querySelector('#ticketSaleForm');if(form){form.elements.documentNumber.value=number;form.querySelector('#saleIdentityConfirmed').checked=false;}},value=>{photo=value;},source,result=>{const form=document.querySelector('#ticketSaleForm');if(!form)return;if(result.customerName&&!form.elements.passengerName.value)form.elements.passengerName.value=result.customerName;if(result.kind)form.elements.documentKind.value=result.kind;});}
       finally{reading=false;}
     };
-    const native=nativeIdentityAvailable();box.querySelector('#saleNativeCamera').hidden=!native;box.querySelector('#saleNativeGallery').hidden=!native;box.querySelector('#saleWebPhoto').hidden=native;
-    box.querySelector('#saleNativeCamera').onclick=e=>read(e.currentTarget,'camera');box.querySelector('#saleNativeGallery').onclick=e=>read(e.currentTarget,'gallery');
-    box.querySelector('#saleIdentityPhoto').onchange=e=>read(e.target);
-    box.querySelector('#saleIdentityClear').onclick=()=>{captureSerial++;photo='';preview.removeAttribute('src');preview.hidden=true;confirmed.checked=false;f.elements.documentNumber.value='';f.elements.documentExpiresOn.value='';box.querySelector('#saleIdentityPhoto').value='';box.querySelector('#saleIdentityCandidates').replaceChildren();status.textContent='Pièce retirée.';};
+    box.querySelector('#saleNativeCamera').onclick=e=>read(e.currentTarget,'camera');
+    box.querySelector('#saleIdentityClear').onclick=()=>{captureSerial++;photo='';preview.removeAttribute('src');preview.hidden=true;confirmed.checked=false;f.elements.documentNumber.value='';f.elements.documentExpiresOn.value='';box.querySelector('#saleIdentityCandidates').replaceChildren();status.textContent='Pièce retirée.';};
   }
   function saleDocument() {
     const f=document.querySelector('#ticketSaleForm');if(!f)return null;
@@ -51,6 +53,8 @@ export function createIdentityTicketUi(ctx) {
     const number=normalized(f.elements.documentNumber.value);
     if(!number&&!photo)return null;
     if(!number)throw Error('Confirmez le numéro de la pièce photographiée.');
+    if(!photo)throw Error('Prenez la photo de la pièce avant d’associer son numéro au billet.');
+    if(documentNumberKind(number)!==f.elements.documentKind.value)throw Error('Vérifiez le numéro : CNIB B… ou passeport A….');
     if(!f.querySelector('#saleIdentityConfirmed')?.checked)throw Error('Vérifiez et confirmez la pièce avant de créer le billet.');
     return {kind:f.elements.documentKind.value,number,expiresOn:f.elements.documentExpiresOn.value,photo};
   }
@@ -60,10 +64,8 @@ export function createIdentityTicketUi(ctx) {
     const input=host.querySelector('[name=number]'),status=host.querySelector('[role=status]'),results=host.querySelector('#boardingIdentityResults');
     status.id='boardingIdentityStatus';host.querySelector('img').id='boardingIdentityPreview';
     const photoInput=host.querySelector('#boardingIdentityPhoto');
-    photoInput.closest('label').insertAdjacentHTML('beforebegin','<div class="button-row"><button type="button" id="boardingNativeCamera">Prendre une photo</button><button type="button" id="boardingNativeGallery">Importer une image</button></div>');
-    const native=nativeIdentityAvailable();photoInput.closest('label').hidden=native;host.querySelector('#boardingNativeCamera').hidden=!native;host.querySelector('#boardingNativeGallery').hidden=!native;
-    const read=(el,source='file')=>capture(el,status,host.querySelector('#boardingIdentityCandidates'),host.querySelector('img'),number=>{const field=document.querySelector('#boardingIdentity [name=number]');if(field)field.value=number;},()=>{},source);
-    photoInput.onchange=e=>read(e.target);host.querySelector('#boardingNativeCamera').onclick=e=>read(e.currentTarget,'camera');host.querySelector('#boardingNativeGallery').onclick=e=>read(e.currentTarget,'gallery');
+    photoInput.closest('label').outerHTML='<button type="button" class="primary camera-action" id="boardingNativeCamera">Photographier et lire la pièce</button>';
+    host.querySelector('#boardingNativeCamera').onclick=e=>capture(e.currentTarget,status,host.querySelector('#boardingIdentityCandidates'),host.querySelector('img'),number=>{const field=document.querySelector('#boardingIdentity [name=number]');if(field)field.value=number;},()=>{},'camera',result=>{if(result.primaryNumber&&document.querySelector('#boardingTrip')?.value)document.querySelector('#boardingIdentity form')?.requestSubmit();});
     host.querySelector('form').onsubmit=async e=>{
       e.preventDefault();const b=e.target.querySelector('[type=submit]');if(b.disabled)return;b.disabled=true;results.replaceChildren();
       try {

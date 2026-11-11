@@ -10,6 +10,14 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from .transport import lock_company
 
+def validate_document_number(kind, number):
+    import re
+    normalized = ''.join(str(number).upper().split()).replace('-', '')
+    prefix = {'CNIB': 'B', 'Passeport': 'A'}.get(kind)
+    if prefix and (not re.fullmatch(prefix + r'[A-Z0-9]{4,29}', normalized) or not any(c.isdigit() for c in normalized)):
+        raise HTTPException(422, 'Numéro incorrect : CNIB B… ou passeport A…')
+    return normalized
+
 PRIVATE_TYPES = {'parking', 'fleet_events', 'customer_documents', 'travel_packs', 'tracking_events', 'trip_shares'}
 
 class ParkingRequest(BaseModel):
@@ -270,7 +278,10 @@ def install(app, env):
         if not c or not c.active:raise HTTPException(404,'Lien indisponible')
         tr=get(db,c.id,'ticket_trips',share.payload['tripId'])
         events=sorted((p for p in rows(db,c.id,'tracking_events') if p['tripId']==tr['id']),key=lambda p:p['createdAt'],reverse=True)
-        position=next((p for p in events if p.get('latitude') is not None),None)
+        from .extensions import legacy_trip_time
+        positioned=[p for p in events if p.get('latitude') is not None]
+        position=max(positioned,key=lambda p:legacy_trip_time(p.get('recordedAt') or p['createdAt'])) if positioned else None
+        if position:position={**position,'createdAt':position.get('recordedAt') or position['createdAt']}
         return {'company':c.name,'trip':{k:tr.get(k) for k in ('origin','destination','stops','departureAt','status','actualArrivalAt')},'events':[{k:p.get(k) for k in ('stage','message','createdAt')} for p in events[:50]],'position':{k:position.get(k) for k in ('latitude','longitude','accuracy','createdAt')} if position else None,'serverTime':now().isoformat()}
 
     @app.get('/api/v2/public/voyage/{token}')
@@ -282,7 +293,7 @@ def install(app, env):
         # No interpolation of personal or operational text into executable HTML.
         import json
         endpoint=json.dumps('/api/v2/public/voyage/'+token)
-        return HTMLResponse('''<!doctype html><html lang="fr"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Suivi du voyage · YamTrans</title><style>body{font:17px system-ui;background:#081b30;color:white;margin:0;padding:24px}main{max-width:850px;margin:auto}h1{font-size:36px}.card{background:#142f48;padding:22px;border-radius:18px;margin:16px 0}small{color:#b9cad9}a{color:#6ee7b7}.event{border-left:3px solid #34d399;padding:12px;margin:12px}</style><main><small>SUIVI DU VOYAGE</small><h1 id="route">Chargement…</h1><div class="card" id="status"></div><div class="card" id="position"></div><div id="events"></div></main><script>const url='''+endpoint+''';async function refresh(){try{const r=await fetch(url);if(!r.ok)throw Error('Lien indisponible');const d=await r.json();document.querySelector('#route').textContent=d.trip.origin+' → '+d.trip.destination;document.querySelector('#status').textContent=d.company+' · '+d.trip.status+' · départ '+new Date(d.trip.departureAt).toLocaleString('fr-FR');const box=document.querySelector('#position');box.replaceChildren();if(d.position){const p=d.position,age=Date.now()-Date.parse(p.createdAt);box.append((age>300000?'Position ancienne · ':'Dernière position · ')+new Date(p.createdAt).toLocaleString('fr-FR')+' ');const a=document.createElement('a');a.href='https://www.openstreetmap.org/?mlat='+p.latitude+'&mlon='+p.longitude+'#map=13/'+p.latitude+'/'+p.longitude;a.textContent='Voir sur la carte';a.target='_blank';a.rel='noopener';box.append(a)}else box.textContent='Position non transmise par l’équipage';const host=document.querySelector('#events');host.replaceChildren();for(const e of d.events){const div=document.createElement('div');div.className='event';div.textContent=e.stage+' · '+e.message+' · '+new Date(e.createdAt).toLocaleString('fr-FR');host.append(div)}}catch(e){document.querySelector('#status').textContent='Suivi indisponible. Les informations affichées peuvent être anciennes.'}}refresh();setInterval(refresh,30000)</script></html>''')
+        return HTMLResponse('''<!doctype html><html lang="fr"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Suivi du voyage · YamTrans</title><style>body{font:17px system-ui;background:#081b30;color:white;margin:0;padding:24px}main{max-width:850px;margin:auto}h1{font-size:36px}.card{background:#142f48;padding:22px;border-radius:18px;margin:16px 0}small{color:#b9cad9}a{color:#6ee7b7}.event{border-left:3px solid #34d399;padding:12px;margin:12px}</style><main><small>SUIVI DU VOYAGE</small><h1 id="route">Chargement…</h1><div class="card" id="status"></div><div class="card" id="position"></div><div id="events"></div></main><script>const url='''+endpoint+''';async function refresh(){try{const r=await fetch(url);if(!r.ok)throw Error('Lien indisponible');const d=await r.json();document.querySelector('#route').textContent=d.trip.origin+' → '+d.trip.destination;document.querySelector('#status').textContent=d.company+' · '+d.trip.status+' · départ '+new Date(d.trip.departureAt).toLocaleString('fr-FR');const box=document.querySelector('#position');box.replaceChildren();if(d.position){const p=d.position,age=Date.now()-Date.parse(p.createdAt);box.append((age>300000?'Position ancienne · ':'Dernière position · ')+new Date(p.createdAt).toLocaleString('fr-FR')+' ');const a=document.createElement('a');a.href='https://www.openstreetmap.org/?mlat='+p.latitude+'&mlon='+p.longitude+'#map=13/'+p.latitude+'/'+p.longitude;a.textContent='Ouvrir la carte';a.target='_blank';a.rel='noopener';box.append(a);const frame=document.createElement('iframe'),lat=Math.max(-85,Math.min(85,p.latitude)),lon=p.longitude,bbox=[Math.max(-180,lon-.025),Math.max(-85,lat-.018),Math.min(180,lon+.025),Math.min(85,lat+.018)].join(',');frame.src='https://www.openstreetmap.org/export/embed.html?bbox='+encodeURIComponent(bbox)+'&layer=mapnik&marker='+encodeURIComponent(p.latitude+','+p.longitude);frame.title='Position du véhicule';frame.referrerPolicy='no-referrer';frame.style.cssText='width:100%;height:320px;border:0;border-radius:14px;margin-top:16px';box.append(frame)}else box.textContent='Position non transmise par l’équipage';const host=document.querySelector('#events');host.replaceChildren();for(const e of d.events){const div=document.createElement('div');div.className='event';div.textContent=e.stage+' · '+e.message+' · '+new Date(e.createdAt).toLocaleString('fr-FR');host.append(div)}}catch(e){document.querySelector('#status').textContent='Suivi indisponible. Les informations affichées peuvent être anciennes.'}}refresh();setInterval(refresh,30000)</script></html>''')
 
     @app.post('/api/v2/operations/documents/ocr')
     def ocr(req:OcrRequest,token=Depends(auth),db=Depends(session)):
@@ -301,7 +312,9 @@ def install(app, env):
         if req.photo:
             from .identity_ocr import decode_image
             decode_image(req.photo)
-        number=''.join(req.number.upper().split())
+        number=validate_document_number(req.kind, req.number)
+        if req.kind in {'CNIB','Passeport'} and not req.photo:
+            raise HTTPException(422, 'Photographiez la pièce avant de l’enregistrer')
         if req.expiresOn and date(req.expiresOn)<now().date():raise HTTPException(422,'La pièce est déjà expirée')
         matches=[p for p in rows(db,c.id,'customer_documents') if p['number']==number and p.get('active')]
         if matches:raise HTTPException(409,'Cette pièce est déjà enregistrée')
@@ -324,7 +337,7 @@ def install(app, env):
     @app.get('/api/v2/operations/documents/lookup')
     def lookup(number:str,token=Depends(auth),db=Depends(session)):
         c,u=access(db,token,'boarding')
-        number=''.join(number.upper().split())
+        number=''.join(number.upper().split()).replace('-','')
         p=next((p for p in rows(db,c.id,'customer_documents') if p['number']==number and p.get('active')),None)
         if not p:raise HTTPException(404,'Pièce non reconnue')
         if p.get('expiresOn') and date(p['expiresOn'])<now().date():raise HTTPException(409,'Pièce expirée : renouvellement requis')

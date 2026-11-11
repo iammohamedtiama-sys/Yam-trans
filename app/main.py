@@ -21,6 +21,7 @@ from sqlalchemy import Boolean, DateTime, Integer, JSON, String, Text, UniqueCon
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 from .operations import install as install_operations
 from .extensions import install as install_extensions
+from .gps import install as install_gps
 from .transport import install as install_transport, lock_company, READ_ONLY_TYPES, active as transport_active
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./yamtrans-sync.db")
@@ -110,7 +111,7 @@ with engine.begin() as conn:
     except Exception:
         try: conn.execute(text("ALTER TABLE app_users_v3 ADD COLUMN modules JSON"))
         except Exception: pass
-app = FastAPI(title="YAM TRANS Multi-Sociétés · Courrier & Billetterie", version="4.9.0")
+app = FastAPI(title="YAM TRANS Multi-Sociétés · Courrier & Billetterie", version="4.10.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -549,7 +550,7 @@ def agency_public_info(db: Session, company_id: str, name: str) -> dict[str, str
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "transport-multitenant-sync", "version": "4.9.0", "time": utcnow().isoformat()}
+    return {"status": "ok", "service": "transport-multitenant-sync", "version": "4.10.0", "time": utcnow().isoformat()}
 
 
 @app.post("/api/v2/auth/login")
@@ -846,6 +847,10 @@ def sync_v2(req: SyncRequest, token: dict[str, Any] = Depends(read_token), db: S
                     continue
                 if previous.get("refundId") and any(payload.get(k) != previous.get(k) for k in ("status", "refundId", "refundedAmount", "paid", "fare")):
                     conflicts.append({"type":"refund_protected", "entityType":entity_type, "id":entity_id, "message":"Un remboursement validé ne peut pas être modifié par synchronisation"})
+                    continue
+                protected_ticket_fields=('fare','paid','balance','paymentMethod','packId','customerId','documentNumber','boarded','boardedAt','boardedBy','status')
+                if any(payload.get(k)!=previous.get(k) for k in protected_ticket_fields):
+                    conflicts.append({'type':'ticket_server_required','entityType':entity_type,'id':entity_id,'message':'Le prix, les règlements, la pièce et l’embarquement doivent être confirmés par le serveur'})
                     continue
             if entity_type == "tickets" and payload.get("confirmationSource") == "offline" and payload.get("status") == "À synchroniser":
                 payload["status"] = "Confirmé"
@@ -1527,7 +1532,7 @@ def tracking_page(company: str = Query(default=DEFAULT_COMPANY_CODE), code: str 
 
 @app.get("/")
 def root():
-    return {"service": "Transport Multi-Sociétés", "version": "4.9.0", "health": f"{PUBLIC_BASE_URL}/health", "tracking": f"{PUBLIC_BASE_URL}/suivi?company={DEFAULT_COMPANY_CODE}&code=OUA-00001"}
+    return {"service": "Transport Multi-Sociétés", "version": "4.10.0", "health": f"{PUBLIC_BASE_URL}/health", "tracking": f"{PUBLIC_BASE_URL}/suivi?company={DEFAULT_COMPANY_CODE}&code=OUA-00001"}
 
 
 # Interface web complète : le même client que l'application Android, avec les mêmes rôles.
@@ -1561,3 +1566,4 @@ if os.path.isdir(WEBAPP_DIR):
 install_transport(app, globals())
 install_operations(app, globals())
 install_extensions(app, globals())
+install_gps(app, globals())

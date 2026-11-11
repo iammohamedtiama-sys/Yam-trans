@@ -1,7 +1,8 @@
 // OCR suggestions are never proof of identity. The agent confirms the document.
 const plain=s=>String(s).normalize('NFD').replace(/[\u0300-\u036f]/g,'').toUpperCase();
 const cleanNumber=s=>s.toUpperCase().replace(/[\s-]/g,'').replace(/^([A-Z]{1,3})([0-9OI]+)$/,(_,prefix,digits)=>prefix+digits.replace(/O/g,'0').replace(/I/g,'1'));
-export function parseIdentityText(text){
+export function documentNumberKind(value){const n=cleanNumber(String(value||''));return /^B[A-Z0-9]{4,29}$/.test(n)&&/\d/.test(n)?'CNIB':/^A[A-Z0-9]{4,29}$/.test(n)&&/\d/.test(n)?'Passeport':'';}
+export function parseIdentityText(text,preferredKind=''){
  const lines=String(text||'').split(/\r?\n/).map(s=>s.trim()).filter(Boolean),found=new Map();
  const add=(raw,score)=>{const value=cleanNumber(raw);if(value.length<6||value.length>24||!/[0-9]{4}/.test(value)||/^(19|20)\d{2}$/.test(value))return;found.set(value,Math.max(found.get(value)||0,score));};
  for(let i=0;i<lines.length;i++){
@@ -17,7 +18,9 @@ export function parseIdentityText(text){
   // ICAO document number at the beginning of a passport MRZ line.
   if(/^[A-Z0-9<]{30,44}$/.test(line)&&/\d/.test(line.slice(0,9)))add(line.slice(0,9).replace(/</g,''),85);
  }
- const candidates=[...found].sort((a,b)=>b[1]-a[1]).map(([n])=>n).slice(0,15);
+ const detected=/PASSEPORT|PASSPORT|P<BFA/.test(plain(text))?'Passeport':/CNIB|CARTE\s+NATIONALE/.test(plain(text))?'CNIB':'';
+ const expected=preferredKind||detected;
+ const candidates=[...found].filter(([n])=>documentNumberKind(n)&&(!expected||documentNumberKind(n)===expected)).sort((a,b)=>b[1]-a[1]).map(([n])=>n).slice(0,15);
  const field=pattern=>{
   for(let i=0;i<lines.length;i++){
    const normalized=plain(lines[i]);const m=normalized.match(pattern);if(!m)continue;
@@ -28,6 +31,6 @@ export function parseIdentityText(text){
  };
  const surname=field(/^(?:NOM(?:\s*\/\s*SURNAME)?|SURNAME)\s*:?\s*/);
  const firstNames=field(/^(?:PRENOMS?(?:\s*\/\s*GIVEN\s*NAMES?)?|GIVEN\s*NAMES?)\s*:?\s*/);
- const kind=/PASSEPORT|PASSPORT/.test(plain(text))?'Passeport':/CNIB|CARTE\s+NATIONALE/.test(plain(text))?'CNIB':'';
+ const kind=expected||documentNumberKind(candidates[0]);
  return {text:String(text||''),candidates,primaryNumber:candidates[0]||'',customerName:[firstNames,surname].filter(Boolean).join(' '),kind,requiresConfirmation:true};
 }
