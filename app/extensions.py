@@ -1,3 +1,4 @@
+from .permissions import verified_action
 """Native YamTrans extensions; no third-party application code is imported."""
 import hashlib
 import json
@@ -131,6 +132,7 @@ def install(app, env):
         if write:
             lock_company(db, Company, token.get('cid'))
         c, u = env['resolve_company_user'](token, db)
+        if verified_action(u) and (c.settings or {}).get("modules",{}).get("tickets"):return c,u
         manager = u.role in {'admin', 'company_admin', 'superuser'}
         modules = u.modules or {}
         granted = set(modules.get('ticketRoles', []))

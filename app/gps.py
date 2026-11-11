@@ -1,3 +1,4 @@
+from .permissions import verified_action
 """Authenticated HTTP GPS ingestion, independent from passenger/account credentials."""
 import hashlib
 import hmac
@@ -58,7 +59,7 @@ def install(app, env):
         if write:lock_company(db,Company,token.get('cid'))
         c,u=env['resolve_company_user'](token,db)
         roles=set((u.modules or {}).get('ticketRoles',[]));manager=u.role in {'admin','company_admin','superuser'} or 'manager' in roles
-        if not (c.settings or {}).get('modules',{}).get('tickets') or (not manager and (not (u.modules or {}).get('tickets') or not roles & {'dispatch','driver','reports'})) or (manage and not manager):
+        if not (c.settings or {}).get('modules',{}).get('tickets') or (not manager and (not (u.modules or {}).get('tickets') or not roles & {'dispatch','driver','reports'})) or (manage and not manager and not verified_action(u)):
             raise HTTPException(403,'Droit de suivi GPS insuffisant')
         return c,u,manager or bool(roles & {'dispatch','reports'})
 

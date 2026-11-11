@@ -1,9 +1,11 @@
+from .permissions import verified_action
 """Additive operational modules. Private data never enters public tracking views."""
 import math
 import secrets
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Literal
+from .extensions import legacy_trip_time
 from fastapi import Depends, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
@@ -63,6 +65,8 @@ class TrackingRequest(BaseModel):
     latitude: float | None = Field(default=None, ge=-90, le=90, allow_inf_nan=False)
     longitude: float | None = Field(default=None, ge=-180, le=180, allow_inf_nan=False)
     accuracy: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    speedKph: float | None = Field(default=None, ge=0, le=400, allow_inf_nan=False)
+    recordedAt: str = ''
 
 class OcrRequest(BaseModel):
     image: str = Field(max_length=7_000_000)
@@ -131,7 +135,7 @@ def install(app, env):
         roles=(u.modules or {}).get('ticketRoles',[])
         if not (c.settings or {}).get('modules',{}).get('tickets'):
             raise HTTPException(403,'Module Tickets requis')
-        if u.role not in {'admin','company_admin','superuser'} and (not (u.modules or {}).get('tickets') or ((role not in roles if role!='any' else not any(r in roles for r in ('sales','dispatch','driver','boarding','reports'))) and 'manager' not in roles)):
+        if not verified_action(u) and u.role not in {'admin','company_admin','superuser'} and (not (u.modules or {}).get('tickets') or ((role not in roles if role!='any' else not any(r in roles for r in ('sales','dispatch','driver','boarding','reports'))) and 'manager' not in roles)):
             raise HTTPException(403,'Droit insuffisant')
         return c,u
 
@@ -156,7 +160,8 @@ def install(app, env):
                 raise HTTPException(422,'Chauffeur requis')
             if not ident: continue
             person=db.get(User,ident)
-            if not person or person.company_id!=cid or not person.active or not (person.modules or {}).get('tickets') or 'driver' not in (person.modules or {}).get('ticketRoles',[]):
+            if person and key=='driverId' and (person.modules or {}).get('profile')=='conductor':raise HTTPException(422,'Sélectionnez un compte chauffeur pour la conduite')
+            if not person or person.company_id!=cid or not person.active or not (person.modules or {}).get('tickets') or not (set((person.modules or {}).get('ticketRoles',[])) & ({'driver'} if key=='driverId' else {'driver','conductor'})):
                 raise HTTPException(422,'Choisissez un compte équipage actif de cette société')
         if p.get('driverId')==p.get('conductorId'):
             raise HTTPException(422,'Chauffeur et convoyeur doivent être distincts')
@@ -237,6 +242,15 @@ def install(app, env):
     def crew(ident:str,req:CrewRequest,token=Depends(auth),db=Depends(session)):
         c,u=access(db,token,'dispatch',True);p=req.model_dump();crew_validate(db,c.id,p)
         tr=get(db,c.id,'ticket_trips',ident)
+        if tr.get('driverId','')==req.driverId and tr.get('conductorId','')==req.conductorId:return tr
+        from .management import interval
+        a,b=interval(tr)
+        for other in rows(db,c.id,'ticket_trips'):
+            if other['id']==ident or other.get('status')=='Annulé':continue
+            if not ({req.driverId,req.conductorId}-{''}) & {other.get('driverId'),other.get('conductorId')}:continue
+            x,y=interval(other)
+            if a<y and x<b:raise HTTPException(409,'Cet équipage est déjà affecté à un voyage sur ce créneau')
+        put(db,c.id,'staff_assignments',{'tripId':ident,'previousDriverId':tr.get('driverId',''),'previousConductorId':tr.get('conductorId',''),**p,'createdBy':u.id,'createdAt':now().isoformat()})
         result=put(db,c.id,'ticket_trips',{**tr,**p,'driver':db.get(User,req.driverId).name,'conductor':db.get(User,req.conductorId).name if req.conductorId else ''})
         audit(db,c,u,'Équipage affecté',ident);db.commit();return result
 
@@ -258,6 +272,9 @@ def install(app, env):
         c,u=access(db,token,'any',True);tr=get(db,c.id,'ticket_trips',ident)
         if u.role not in {'admin','company_admin','superuser'} and not any(r in (u.modules or {}).get('ticketRoles',[]) for r in ('manager','dispatch')) and u.id not in {tr.get('driverId'),tr.get('conductorId')}:
             raise HTTPException(403,'Vous ne faites pas partie de cet équipage')
+        if req.recordedAt:
+            recorded=legacy_trip_time(req.recordedAt)
+            if abs((now()-recorded).total_seconds())>300:raise HTTPException(422,'Position téléphone trop ancienne ou future')
         old=retry(db,c,u,'tracking_events',req.id)
         if old:return old
         if (req.latitude is None)!=(req.longitude is None) or (req.stage=='Position' and req.latitude is None):
@@ -266,7 +283,7 @@ def install(app, env):
         if 'queue_trip_notifications' in env:
             env['queue_trip_notifications'](db,c,u,tr,item)
         if req.stage in {'Parti','Arrivé','Embarquement'}:
-            put(db,c.id,'ticket_trips',{**tr,'status':req.stage,'actualArrivalAt':item['createdAt']} if req.stage=='Arrivé' else {**tr,'status':req.stage})
+            put(db,c.id,'ticket_trips',{**tr,'status':req.stage,'actualArrivalAt':item['createdAt']} if req.stage=='Arrivé' else {**tr,'status':req.stage,**({'actualDepartureAt':item['createdAt']} if req.stage=='Parti' else {})})
         db.commit();return item
 
     def public_data(db,token):
@@ -423,7 +440,7 @@ def install(app, env):
         rest_hours=float((c.settings or {}).get('crewRestHours',10));weekly_limit=float((c.settings or {}).get('crewWeeklyTrips',8))
         week=now()-timedelta(days=7)
         for person in db.scalars(select(User).where(User.company_id==c.id,User.active.is_(True))).all():
-            if 'driver' not in (person.modules or {}).get('ticketRoles',[]):continue
+            if not set((person.modules or {}).get('ticketRoles',[])) & {'driver','conductor'}:continue
             assigned=sorted([t for t in trips if person.id in {t.get('driverId'),t.get('conductorId')}],key=lambda t:t['departureAt'])
             recent=[t for t in assigned if week.isoformat()<=t['departureAt']<=now().isoformat()]
             alerts=[]

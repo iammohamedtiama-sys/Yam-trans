@@ -38,7 +38,7 @@ export function createTrackingUi(ctx){
     document.querySelector('#gpsPhone')?.addEventListener('click',e=>run(e.currentTarget,async()=>{
       const tripId=document.querySelector('#gpsPhoneTrip').value;if(!tripId)throw Error('Choisissez le voyage.');
       const position=await getCurrentLocation();
-      await ctx.operationsApi('/trips/'+encodeURIComponent(tripId)+'/tracking',{id:crypto.randomUUID(),stage:'Position',latitude:position.coords.latitude,longitude:position.coords.longitude,accuracy:position.coords.accuracy});await load();notify('Position transmise.','success');
+      await ctx.operationsApi('/trips/'+encodeURIComponent(tripId)+'/tracking',{id:crypto.randomUUID(),stage:'Position',latitude:position.coords.latitude,longitude:position.coords.longitude,accuracy:position.coords.accuracy,speedKph:position.coords.speed==null?null:Math.max(0,position.coords.speed*3.6),recordedAt:new Date(position.timestamp||Date.now()).toISOString()});await load();notify('Position transmise.','success');
     }));
   }
   return {panel,bind};

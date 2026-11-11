@@ -1,3 +1,4 @@
+import { captureCameraPhoto } from './camera-capture.js';
 import { documentNumberKind } from './identity-text.js';
 import { readIdentityDocument } from './document-reader.js';
 // Identity photos stay in memory until the server saves the sale atomically.
@@ -34,14 +35,14 @@ export function createIdentityTicketUi(ctx) {
     ref.innerHTML='Numéro de CNIB / passeport<input name="documentNumber" maxlength="100" autocomplete="off">';
     const box=document.createElement('section');box.className='identity-sale-card';
     box.innerHTML=`<div><b>Voyager avec sa pièce d’identité</b><p>Prenez la photo de la CNIB (B…) ou du passeport (A…). La pièce permet ensuite de retrouver le billet à l’embarquement.</p></div><div class="grid"><label>Type de pièce<select name="documentKind"><option>CNIB</option><option>Passeport</option></select></label><label>Expiration de la pièce<input name="documentExpiresOn" type="date"></label></div><div class="button-row"><button type="button" id="saleNativeCamera">Prendre une photo</button></div><img hidden class="ops-document-photo" id="saleIdentityPreview" alt="Pièce à vérifier"><p id="saleIdentityStatus" role="status"></p><div id="saleIdentityCandidates" class="button-row"></div><label><input type="checkbox" id="saleIdentityConfirmed" name="documentConfirmed"> J’ai vérifié le numéro, le nom et la photo sur la pièce</label><button type="button" id="saleIdentityClear">Retirer la pièce</button>`;
-    ref.parentElement.insertAdjacentElement('afterend',box);
+    box.querySelector('.grid').append(ref);const cameraRow=box.querySelector('.button-row');box.insertBefore(cameraRow,box.querySelector('.grid'));const fields=box.querySelector('.grid');box.insertBefore(fields,box.querySelector('#saleIdentityConfirmed').closest('label'));f.prepend(box);box.querySelector('b').textContent='1 · Photographier la pièce du passager';
     const status=box.querySelector('#saleIdentityStatus'),preview=box.querySelector('img'),confirmed=box.querySelector('#saleIdentityConfirmed');
     if(photo){preview.src=photo;preview.hidden=false;status.textContent='Photo prête à être associée au billet.';}
     const invalidate=()=>{confirmed.checked=false;};
     f.elements.documentNumber.addEventListener('input',invalidate);f.elements.passengerName.addEventListener('input',invalidate);f.elements.phone.addEventListener('input',invalidate);
     const read=async(input,source='camera')=>{
       if(reading)return;reading=true;confirmed.checked=false;
-      try{await capture(input,status,box.querySelector('#saleIdentityCandidates'),preview,number=>{const form=document.querySelector('#ticketSaleForm');if(form){form.elements.documentNumber.value=number;form.querySelector('#saleIdentityConfirmed').checked=false;}},value=>{photo=value;},source,result=>{const form=document.querySelector('#ticketSaleForm');if(!form)return;if(result.customerName&&!form.elements.passengerName.value)form.elements.passengerName.value=result.customerName;if(result.kind)form.elements.documentKind.value=result.kind;});}
+      try{await capture(input,status,box.querySelector('#saleIdentityCandidates'),preview,number=>{const form=document.querySelector('#ticketSaleForm');if(form){form.elements.documentNumber.value=number;form.querySelector('#saleIdentityConfirmed').checked=false;}},value=>{photo=value;},source,result=>{const form=document.querySelector('#ticketSaleForm');if(!form)return;if(result.customerName)form.elements.passengerName.value=result.customerName;if(result.kind)form.elements.documentKind.value=result.kind;if(result.expiresOn)form.elements.documentExpiresOn.value=result.expiresOn;form.elements.passengerName.dispatchEvent(new window.Event('change',{bubbles:true}));});}
       finally{reading=false;}
     };
     box.querySelector('#saleNativeCamera').onclick=e=>read(e.currentTarget,'camera');
@@ -65,7 +66,9 @@ export function createIdentityTicketUi(ctx) {
     status.id='boardingIdentityStatus';host.querySelector('img').id='boardingIdentityPreview';
     const photoInput=host.querySelector('#boardingIdentityPhoto');
     photoInput.closest('label').outerHTML='<button type="button" class="primary camera-action" id="boardingNativeCamera">Photographier et lire la pièce</button>';
-    host.querySelector('#boardingNativeCamera').onclick=e=>capture(e.currentTarget,status,host.querySelector('#boardingIdentityCandidates'),host.querySelector('img'),number=>{const field=document.querySelector('#boardingIdentity [name=number]');if(field)field.value=number;},()=>{},'camera',result=>{if(result.primaryNumber&&document.querySelector('#boardingTrip')?.value)document.querySelector('#boardingIdentity form')?.requestSubmit();});
+    const scan=async()=>{if(!document.querySelector('#boardingTrip')?.value)return notify('Choisissez le départ à contrôler.','warning');try{const shot=await captureCameraPhoto({scanQr:true});if(shot?.type==='qr'){await ctx.scanCode(shot.value);return;}status.textContent='Lecture de la pièce…';const result=await readIdentityDocument({source:'camera',image:shot},image=>api('/documents/ocr',{image}));if(!host.isConnected)return;const preview=host.querySelector('img');preview.src=shot;preview.hidden=false;if(result.primaryNumber){input.value=result.primaryNumber;host.querySelector('form').requestSubmit();}else status.textContent=result.warning||'Numéro non lu : reprenez une photo ou saisissez le numéro.';}catch(e){if(e.code!=='CANCELLED')notify(e.message,'warning');}};
+    const launch=document.querySelector('#scanTicketQr');if(launch){const replacement=launch.cloneNode(true);launch.replaceWith(replacement);replacement.textContent='Scanner QR / CNIB / passeport';replacement.onclick=scan;}
+    host.querySelector('#boardingNativeCamera').remove();
     host.querySelector('form').onsubmit=async e=>{
       e.preventDefault();const b=e.target.querySelector('[type=submit]');if(b.disabled)return;b.disabled=true;results.replaceChildren();
       try {

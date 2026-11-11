@@ -1,3 +1,4 @@
+from .permissions import verified_action
 """Transport workflows over the existing tenant-scoped entity store.
 
 No third-party application code is imported. All writes use the same company
@@ -191,6 +192,7 @@ def install(app, env):
         c, u = env["resolve_company_user"](token, db)
         if not (c.settings or {}).get("modules", {}).get("tickets", False):
             raise HTTPException(403, "Module Tickets non activé")
+        if verified_action(u):return c,u
         manager = u.role in {"company_admin", "superuser", "admin"}
         roles = (u.modules or {}).get("ticketRoles", [])
         if not manager and (not (u.modules or {}).get("tickets") or (role not in roles and "manager" not in roles)):
