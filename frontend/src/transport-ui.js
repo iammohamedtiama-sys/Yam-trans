@@ -18,7 +18,7 @@ export function createTransportUi(ctx) {
   }
   async function synced() {
     if(!await ctx.sync())throw new Error('Synchronisez YamTrans avec le serveur avant cette opération');
-    if(state.syncStatus==='conflict')throw new Error('Résolvez les conflits de synchronisation avant cette opération');
+    // Conflicting records are archived individually; every new operation is validated by its server endpoint.
   }
   async function load() {
     serverData=null;

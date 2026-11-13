@@ -459,12 +459,15 @@ def install(app, env):
                     raise HTTPException(409,"Pièce expirée : renouvellement requis")
                 customer_id=registered["customerId"]
                 if doc_req.photo:
-                    put(db,c.id,"customer_documents",{**registered,"photo":doc_req.photo})
+                    put(db,c.id,"customer_documents",{**registered,"photo":doc_req.photo,**({"birthDate":doc_req.birthDate} if doc_req.birthDate else {})})
             else:
                 customer=next((cst for cst in rows(db,c.id,"ticket_customers") if same_phone(cst.get("phone"),t["phone"]) and same_name(cst.get("name"),t["passengerName"])),None)
                 customer_id=customer["id"] if customer else str(uuid.uuid4())
                 if not customer: put(db,c.id,"ticket_customers",{"id":customer_id,"name":t["passengerName"],"phone":t["phone"],"points":0})
                 put(db,c.id,"customer_documents",{**doc_req.model_dump(),"customerId":customer_id,"number":number,"active":True,"createdBy":u.id,"createdAt":now().isoformat()})
+            if doc_req.birthDate:
+                customer=next((p for p in rows(db,c.id,"ticket_customers") if p['id']==customer_id),{'id':customer_id,'points':0})
+                put(db,c.id,"ticket_customers",{**customer,"birthDate":doc_req.birthDate})
             if t.get("customerId") and t["customerId"]!=customer_id:
                 raise HTTPException(422,"La pièce et le carnet ne correspondent pas au même client")
             t["customerId"]=customer_id

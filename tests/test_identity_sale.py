@@ -32,6 +32,35 @@ def test_photo_at_sale_links_document_and_ticket_atomically(setup):
         assert len(docs)==1
 
 
+def test_birth_date_is_saved_privately_without_using_it_as_document_expiry(setup):
+    h,cid,_=setup
+    req={'ticket':ticket(documentNumber='B12345'),'document':document(birthDate='2002-03-25')}
+    r=post(h,'/tickets/confirm',req);assert r.status_code==200,r.text
+    with m.SessionLocal() as db:
+        customer=db.get(m.EntityV3,{'company_id':cid,'entity_type':'ticket_customers','entity_id':r.json()['ticket']['customerId']})
+        assert customer.payload['birthDate']=='2002-03-25'
+        docs=db.scalars(m.select(m.EntityV3).where(m.EntityV3.company_id==cid,m.EntityV3.entity_type=='customer_documents')).all()
+        assert docs[0].payload['birthDate']=='2002-03-25'
+        assert docs[0].payload['expiresOn']==''
+    assert 'birthDate' not in r.json()['ticket']
+
+
+def test_invalid_birth_date_cannot_create_ticket_or_document(setup):
+    h,_,_=setup
+    for dob in ('2099-01-01','2002-02-31','25/03/2002','1899-01-01'):
+        r=post(h,'/tickets/confirm',{'ticket':ticket(documentNumber='B12345'),'document':document(birthDate=dob)})
+        assert r.status_code==422,r.text
+    assert ops(h,'/documents/lookup?number=B12345',method='GET').status_code==404
+
+
+def test_customer_sync_rejects_future_birth_date_with_identifiable_conflict(setup):
+    h,_,_=setup
+    r=client.post('/api/v2/sync',headers=h,json={'deviceId':'birth-test','entities':{'ticket_customers':[{'id':'future','birthDate':'2099-01-01'}]}})
+    assert r.status_code==200,r.text
+    assert r.json()['conflicts'][0]['entityType']=='ticket_customers'
+    assert r.json()['conflicts'][0]['type']=='birth_date_invalid'
+
+
 def test_invalid_or_conflicting_piece_does_not_sell_seat(setup):
     h,_,_=setup
     for doc in (document(photo='data:image/png;base64,bm90YW5pbWFnZQ=='),document(expiresOn='2000-01-01'),document(number='OTHER')):

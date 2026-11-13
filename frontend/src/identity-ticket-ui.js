@@ -34,19 +34,19 @@ export function createIdentityTicketUi(ctx) {
     const ref=f.elements.documentNumber?.closest('label');if(!ref)return;
     ref.innerHTML='Numéro de CNIB / passeport<input name="documentNumber" maxlength="100" autocomplete="off">';
     const box=document.createElement('section');box.className='identity-sale-card';
-    box.innerHTML=`<div><b>Voyager avec sa pièce d’identité</b><p>Prenez la photo de la CNIB (B…) ou du passeport (A…). La pièce permet ensuite de retrouver le billet à l’embarquement.</p></div><div class="grid"><label>Type de pièce<select name="documentKind"><option>CNIB</option><option>Passeport</option></select></label><label>Expiration de la pièce<input name="documentExpiresOn" type="date"></label></div><div class="button-row"><button type="button" id="saleNativeCamera">Prendre une photo</button></div><img hidden class="ops-document-photo" id="saleIdentityPreview" alt="Pièce à vérifier"><p id="saleIdentityStatus" role="status"></p><div id="saleIdentityCandidates" class="button-row"></div><label><input type="checkbox" id="saleIdentityConfirmed" name="documentConfirmed"> J’ai vérifié le numéro, le nom et la photo sur la pièce</label><button type="button" id="saleIdentityClear">Retirer la pièce</button>`;
+    box.innerHTML=`<div><b>Voyager avec sa pièce d’identité</b><p>Prenez la photo de la CNIB (B…) ou du passeport (A…). La pièce permet ensuite de retrouver le billet à l’embarquement.</p></div><div class="grid"><label>Type de pièce<select name="documentKind"><option>CNIB</option><option>Passeport</option></select></label><label>Date de naissance<input name="passengerBirthDate" type="date" min="1900-01-01" max="${new Date().toISOString().slice(0,10)}"></label></div><div class="button-row"><button type="button" id="saleNativeCamera">Prendre une photo</button></div><img hidden class="ops-document-photo" id="saleIdentityPreview" alt="Pièce à vérifier"><p id="saleIdentityStatus" role="status"></p><div id="saleIdentityCandidates" class="button-row"></div><label><input type="checkbox" id="saleIdentityConfirmed" name="documentConfirmed"> J’ai vérifié le numéro, le nom, la date de naissance et la photo sur la pièce</label><button type="button" id="saleIdentityClear">Retirer la pièce</button>`;
     box.querySelector('.grid').append(ref);const cameraRow=box.querySelector('.button-row');box.insertBefore(cameraRow,box.querySelector('.grid'));const fields=box.querySelector('.grid');box.insertBefore(fields,box.querySelector('#saleIdentityConfirmed').closest('label'));f.prepend(box);box.querySelector('b').textContent='1 · Photographier la pièce du passager';
     const status=box.querySelector('#saleIdentityStatus'),preview=box.querySelector('img'),confirmed=box.querySelector('#saleIdentityConfirmed');
     if(photo){preview.src=photo;preview.hidden=false;status.textContent='Photo prête à être associée au billet.';}
     const invalidate=()=>{confirmed.checked=false;};
-    f.elements.documentNumber.addEventListener('input',invalidate);f.elements.passengerName.addEventListener('input',invalidate);f.elements.phone.addEventListener('input',invalidate);
+    f.elements.passengerBirthDate.addEventListener('input',invalidate);f.elements.documentKind.addEventListener('change',invalidate);f.elements.documentNumber.addEventListener('input',invalidate);f.elements.passengerName.addEventListener('input',invalidate);f.elements.phone.addEventListener('input',invalidate);
     const read=async(input,source='camera')=>{
       if(reading)return;reading=true;confirmed.checked=false;
-      try{await capture(input,status,box.querySelector('#saleIdentityCandidates'),preview,number=>{const form=document.querySelector('#ticketSaleForm');if(form){form.elements.documentNumber.value=number;form.querySelector('#saleIdentityConfirmed').checked=false;}},value=>{photo=value;},source,result=>{const form=document.querySelector('#ticketSaleForm');if(!form)return;if(result.customerName)form.elements.passengerName.value=result.customerName;if(result.kind)form.elements.documentKind.value=result.kind;if(result.expiresOn)form.elements.documentExpiresOn.value=result.expiresOn;form.elements.passengerName.dispatchEvent(new window.Event('change',{bubbles:true}));});}
+      try{await capture(input,status,box.querySelector('#saleIdentityCandidates'),preview,number=>{const form=document.querySelector('#ticketSaleForm');if(form){form.elements.documentNumber.value=number;form.querySelector('#saleIdentityConfirmed').checked=false;}},value=>{photo=value;},source,result=>{const form=document.querySelector('#ticketSaleForm');if(!form)return;if(result.customerName)form.elements.passengerName.value=result.customerName;if(result.kind)form.elements.documentKind.value=result.kind;form.elements.passengerBirthDate.value=result.birthDate||'';form.elements.passengerName.dispatchEvent(new window.Event('change',{bubbles:true}));});}
       finally{reading=false;}
     };
     box.querySelector('#saleNativeCamera').onclick=e=>read(e.currentTarget,'camera');
-    box.querySelector('#saleIdentityClear').onclick=()=>{captureSerial++;photo='';preview.removeAttribute('src');preview.hidden=true;confirmed.checked=false;f.elements.documentNumber.value='';f.elements.documentExpiresOn.value='';box.querySelector('#saleIdentityCandidates').replaceChildren();status.textContent='Pièce retirée.';};
+    box.querySelector('#saleIdentityClear').onclick=()=>{captureSerial++;photo='';preview.removeAttribute('src');preview.hidden=true;confirmed.checked=false;f.elements.documentNumber.value='';f.elements.passengerBirthDate.value='';box.querySelector('#saleIdentityCandidates').replaceChildren();status.textContent='Pièce retirée.';};
   }
   function saleDocument() {
     const f=document.querySelector('#ticketSaleForm');if(!f)return null;
@@ -57,7 +57,7 @@ export function createIdentityTicketUi(ctx) {
     if(!photo)throw Error('Prenez la photo de la pièce avant d’associer son numéro au billet.');
     if(documentNumberKind(number)!==f.elements.documentKind.value)throw Error('Vérifiez le numéro : CNIB B… ou passeport A….');
     if(!f.querySelector('#saleIdentityConfirmed')?.checked)throw Error('Vérifiez et confirmez la pièce avant de créer le billet.');
-    return {kind:f.elements.documentKind.value,number,expiresOn:f.elements.documentExpiresOn.value,photo};
+    return {kind:f.elements.documentKind.value,number,birthDate:f.elements.passengerBirthDate.value,photo};
   }
   function resetSale(){photo='';saleForm=null;reading=false;generation++;captureSerial++;}
   function bindBoarding() {

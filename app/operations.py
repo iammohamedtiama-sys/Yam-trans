@@ -8,7 +8,7 @@ from typing import Literal
 from .extensions import legacy_trip_time
 from fastapi import Depends, HTTPException
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from .transport import lock_company
 
@@ -80,9 +80,23 @@ class DocumentRequest(BaseModel):
     kind: Literal['CNIB', 'Passeport', 'Autre']
     number: str = Field(min_length=3, max_length=100)
     expiresOn: str = ''
+    birthDate: str = Field(default='', max_length=10)
     replacesId: str = ''
     previousNumber: str = Field(default='',max_length=100)
     photo: str = Field(default='',max_length=7_000_000)
+
+    @field_validator('birthDate')
+    @classmethod
+    def valid_birth_date(cls, value):
+        if not value:
+            return value
+        try:
+            parsed = datetime.strptime(value, '%Y-%m-%d').date()
+        except ValueError:
+            raise ValueError('Date de naissance invalide')
+        if parsed.isoformat() != value or parsed.year < 1900 or parsed > datetime.now(timezone.utc).date():
+            raise ValueError('Date de naissance invalide ou future')
+        return value
 
 class PackRequest(BaseModel):
     id: str = Field(min_length=1, max_length=120)
@@ -346,6 +360,9 @@ def install(app, env):
             put(db,c.id,'customer_documents',{**previous,'active':False,'replacedBy':req.id})
             customer=next((p for p in rows(db,c.id,'ticket_customers') if p['id']==customer_id),{'id':customer_id,'points':0})
             put(db,c.id,'ticket_customers',{**customer,'name':req.customerName,'phone':req.phone})
+        if req.birthDate:
+            customer=next((p for p in rows(db,c.id,'ticket_customers') if p['id']==customer_id),{'id':customer_id,'points':0})
+            put(db,c.id,'ticket_customers',{**customer,'birthDate':req.birthDate})
         item=put(db,c.id,'customer_documents',{**req.model_dump(),'customerId':customer_id,'replacesId':previous['id'] if previous else '', 'number':number,'active':True,'createdBy':u.id,'createdAt':now().isoformat()})
         audit(db,c,u,'Pièce client enregistrée',customer_id);db.commit();return {'id':item['id'],'customerId':item['customerId']}
 

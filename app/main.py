@@ -114,7 +114,7 @@ with engine.begin() as conn:
     except Exception:
         try: conn.execute(text("ALTER TABLE app_users_v3 ADD COLUMN modules JSON"))
         except Exception: pass
-app = FastAPI(title="YAM TRANS Multi-Sociétés · Courrier & Billetterie", version="4.11.0")
+app = FastAPI(title="YAM TRANS Multi-Sociétés · Courrier & Billetterie", version="4.11.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -569,7 +569,7 @@ def agency_public_info(db: Session, company_id: str, name: str) -> dict[str, str
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "transport-multitenant-sync", "version": "4.11.0", "time": utcnow().isoformat()}
+    return {"status": "ok", "service": "transport-multitenant-sync", "version": "4.11.1", "time": utcnow().isoformat()}
 
 
 @app.post("/api/v2/auth/login")
@@ -776,12 +776,18 @@ def sync_v2(req: SyncRequest, token: dict[str, Any] = Depends(read_token), db: S
                     if not all(action_allowed(sync_actor,a) for a in needed):
                         conflicts.append({'type':'action_forbidden','entityType':entity_type,'id':entity_id,'detail':'Action non autorisée : '+', '.join(sorted(needed))});continue
                     if payload.get('payrollId') or (old or {}).get('payrollId'):
-                        conflicts.append({'type':'payroll_server_required','id':entity_id});continue
+                        conflicts.append({'type':'payroll_server_required','entityType':entity_type,'id':entity_id});continue
                     if (sync_actor.modules or {}).get('profile') in {'driver','conductor'} and payload.get('tripId'):
                         trip=db.get(EntityV3,{'company_id':company.id,'entity_type':'ticket_trips','entity_id':payload['tripId']})
                         if not trip or sync_actor.id not in {trip.payload.get('driverId'),trip.payload.get('conductorId')}:
-                            conflicts.append({'type':'assignment_required','id':entity_id});continue
+                            conflicts.append({'type':'assignment_required','entityType':entity_type,'id':entity_id});continue
                     if not old:payload['createdBy']=sync_actor.id
+            if entity_type in {'customers','ticket_customers'} and payload.get('birthDate'):
+                from .operations import DocumentRequest
+                try: DocumentRequest.valid_birth_date(str(payload['birthDate']))
+                except ValueError:
+                    conflicts.append({'type':'birth_date_invalid','entityType':entity_type,'id':entity_id,'message':'Date de naissance invalide ou future'})
+                    continue
             incoming_version = int(payload.get("_serverVersion") or 0)
 
             alias = known_aliases.get((entity_type, entity_id))
@@ -1584,7 +1590,7 @@ def tracking_page(company: str = Query(default=DEFAULT_COMPANY_CODE), code: str 
 
 @app.get("/")
 def root():
-    return {"service": "Transport Multi-Sociétés", "version": "4.11.0", "health": f"{PUBLIC_BASE_URL}/health", "tracking": f"{PUBLIC_BASE_URL}/suivi?company={DEFAULT_COMPANY_CODE}&code=OUA-00001"}
+    return {"service": "Transport Multi-Sociétés", "version": "4.11.1", "health": f"{PUBLIC_BASE_URL}/health", "tracking": f"{PUBLIC_BASE_URL}/suivi?company={DEFAULT_COMPANY_CODE}&code=OUA-00001"}
 
 
 # Interface web complète : le même client que l'application Android, avec les mêmes rôles.

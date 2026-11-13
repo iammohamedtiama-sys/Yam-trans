@@ -30,3 +30,10 @@ body.seat-sheet-active .mobile-nav{visibility:hidden}
 }
 @media(max-width:380px){.metric-grid{grid-template-columns:minmax(0,1fr)}.workspace>header h1{font-size:16px}.header-badges button{padding:8px;min-width:40px}.mobile-nav small{font-size:9px}.panel{padding:15px 12px}.button-row>button{flex-basis:100%}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important;scroll-behavior:auto!important}button:not(:disabled):active,a[data-page]:active{transform:none}}
+
+/* Keep system insets and application headings in separate layout boxes. */
+.workspace>header>div:first-child{min-width:0}
+.workspace>header h1{position:static;display:block;white-space:normal;overflow-wrap:anywhere;margin:0 0 4px}
+.sync-review-button{font-size:12px;padding:6px 10px;min-height:36px;color:#8a4a08;background:#fff4df;border:1px solid #e9bd72}
+.sync-review-dialog{width:min(760px,100%)}.sync-review-card{border:1px solid #dce8e2;border-radius:14px;padding:16px;margin:14px 0}.sync-review-card pre{max-height:220px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;background:#f3f7f5;padding:12px;border-radius:8px}
+@media(max-width:760px){.workspace>header{padding-top:calc(12px + env(safe-area-inset-top,0px));align-items:start}.workspace>header .header-badges{align-self:start}.workspace>header p{margin:4px 0 0}.workspace>header h1{line-height:1.35}.sync-review-button{margin:2px 0}}

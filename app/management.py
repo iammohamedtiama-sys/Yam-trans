@@ -214,6 +214,8 @@ def install(app,env):
                 try:days=(datetime.strptime(item['dueDate'],'%Y-%m-%d').date()-now().date()).days
                 except ValueError:continue
                 if days<=14:add('fleet-'+item['id'],'warning','Échéance flotte : '+str(item.get('label','Entretien')),f'Échéance dans {days} jour(s).','Contrôler l’échéance et programmer l’intervention avec l’exploitation.')
+        birthdays={p.get('id') for p in rows(db,c.id,'ticket_customers') if p.get('active') is not False and str(p.get('birthDate') or '')[5:]==now().strftime('%m-%d')}
+        if birthdays:add('birthdays-today','info','Anniversaires clients aujourd’hui',f'{len(birthdays)} client(s) avec une date de naissance renseignée.','Consulter la rubrique Clients et vérifier le destinataire avant de préparer un message.')
         unallocated=sum(float(e.get('amount') or 0) for e in data['expenses'] if not e.get('tripId'))
         if unallocated:add('unallocated','info','Charges non affectées à un voyage',f'{unallocated:,.0f} FCFA ne sont pas répartis dans les tronçons.','Affecter les charges pertinentes ; la marge des tronçons reste indicative.')
         return {'period':{'start':begin.date().isoformat(),'end':(finish-timedelta(seconds=1)).date().isoformat()},'thresholds':policy,'channels':channels,'segments':list(segments.values()),'agents':list(agents.values()),'crew':crew,'alerts':alerts,'unallocatedExpenses':unallocated,'method':'Encaissements par date d’opération ; tronçons par date de départ avec leurs billets et charges enregistrés. Recettes de billets réparties entre leurs tronçons ; charges du voyage réparties à parts égales faute de distances. Marge indicative, sans coûts absents ni conclusion automatique sur le personnel.'}
