@@ -1,3 +1,4 @@
+from .permissions import verified_action
 """Transport workflows over the existing tenant-scoped entity store.
 
 No third-party application code is imported. All writes use the same company
@@ -114,11 +115,18 @@ class ConfirmRequest(BaseModel):
 class BatchRequest(BaseModel):
     tickets: list[dict] = Field(min_length=1, max_length=20)
     bookingId: str = Field(min_length=1, max_length=120)
+    documents: dict[str, dict] = Field(default_factory=dict, max_length=20)
 
 
 class RefundRequest(BaseModel):
     amount: float = Field(ge=0, allow_inf_nan=False)
     reason: str = Field(min_length=3, max_length=500)
+
+
+class TicketPaymentRequest(BaseModel):
+    id: str = Field(min_length=1, max_length=100)
+    amount: float = Field(gt=0, le=1_000_000_000_000, multiple_of=0.01, allow_inf_nan=False)
+    paymentMethod: str = 'Espèces'
 
 
 class BoardingRequest(BaseModel):
@@ -181,12 +189,10 @@ def install(app, env):
     def access(db, token, role, write=False):
         if write:
             lock_company(db, Company, token.get("cid"))
-        c = env["require_company"](token, db)
-        u = db.get(User, token.get("uid"))
-        if not u or not u.active or u.company_id != c.id:
-            raise HTTPException(403, "Compte société actif requis")
+        c, u = env["resolve_company_user"](token, db)
         if not (c.settings or {}).get("modules", {}).get("tickets", False):
             raise HTTPException(403, "Module Tickets non activé")
+        if verified_action(u):return c,u
         manager = u.role in {"company_admin", "superuser", "admin"}
         roles = (u.modules or {}).get("ticketRoles", [])
         if not manager and (not (u.modules or {}).get("tickets") or (role not in roles and "manager" not in roles)):
@@ -425,13 +431,15 @@ def install(app, env):
         t.pop("documentPhoto", None)
         t.pop("photo", None)
         if req.document is not None:
-            from .operations import DocumentRequest
+            from .operations import DocumentRequest, validate_document_number
             from pydantic import ValidationError
             try:
                 doc_req=DocumentRequest.model_validate({**req.document,"id":"sale-document-"+str(t["id"]),"customerName":t["passengerName"],"phone":t["phone"]})
             except ValidationError:
                 raise HTTPException(422,"Informations de la pièce incomplètes ou invalides")
-            number="".join(doc_req.number.upper().split())
+            number=validate_document_number(doc_req.kind,doc_req.number)
+            if not doc_req.photo:
+                raise HTTPException(422,'Photographiez la pièce avant de l’associer au billet')
             if number!="".join(str(t.get("documentNumber") or "").upper().split()):
                 raise HTTPException(422,"Le numéro confirmé doit correspondre à la pièce du billet")
             if doc_req.expiresOn:
@@ -451,12 +459,15 @@ def install(app, env):
                     raise HTTPException(409,"Pièce expirée : renouvellement requis")
                 customer_id=registered["customerId"]
                 if doc_req.photo:
-                    put(db,c.id,"customer_documents",{**registered,"photo":doc_req.photo})
+                    put(db,c.id,"customer_documents",{**registered,"photo":doc_req.photo,**({"birthDate":doc_req.birthDate} if doc_req.birthDate else {})})
             else:
                 customer=next((cst for cst in rows(db,c.id,"ticket_customers") if same_phone(cst.get("phone"),t["phone"]) and same_name(cst.get("name"),t["passengerName"])),None)
                 customer_id=customer["id"] if customer else str(uuid.uuid4())
                 if not customer: put(db,c.id,"ticket_customers",{"id":customer_id,"name":t["passengerName"],"phone":t["phone"],"points":0})
                 put(db,c.id,"customer_documents",{**doc_req.model_dump(),"customerId":customer_id,"number":number,"active":True,"createdBy":u.id,"createdAt":now().isoformat()})
+            if doc_req.birthDate:
+                customer=next((p for p in rows(db,c.id,"ticket_customers") if p['id']==customer_id),{'id':customer_id,'points':0})
+                put(db,c.id,"ticket_customers",{**customer,"birthDate":doc_req.birthDate})
             if t.get("customerId") and t["customerId"]!=customer_id:
                 raise HTTPException(422,"La pièce et le carnet ne correspondent pas au même client")
             t["customerId"]=customer_id
@@ -474,6 +485,8 @@ def install(app, env):
         if t.get("documentNumber"):
             normalized="".join(str(t["documentNumber"]).upper().split())
             doc=next((d for d in rows(db,c.id,"customer_documents") if d.get("active") and d.get("number")==normalized),None)
+            if not doc:
+                raise HTTPException(422,'Pièce non enregistrée : photographiez-la avec le billet')
             if doc:
                 if t.get("customerId") and t["customerId"] != doc["customerId"]:
                     raise HTTPException(422,"La pièce et le carnet ne correspondent pas au même client")
@@ -524,7 +537,7 @@ def install(app, env):
         if trip.get("status") in {"Annulé","Terminé","Clôturé","Arrivé"}:
             raise HTTPException(409,"Embarquement fermé pour ce départ")
         if req.documentNumber:
-            number="".join(req.documentNumber.upper().split())
+            number="".join(req.documentNumber.upper().split()).replace('-','')
             doc=next((d for d in rows(db,c.id,"customer_documents") if d.get("active") and d.get("number")==number),None)
             if not doc or (t.get("customerId")!=doc.get("customerId") and "".join(str(t.get("documentNumber") or "").upper().split())!=number):
                 raise HTTPException(403,"Cette pièce ne correspond pas au billet")
@@ -546,11 +559,34 @@ def install(app, env):
         ids=[str(t.get("id") or "") for t in req.tickets]
         if len(set(ids))!=len(ids):
             raise HTTPException(422,"Chaque billet doit avoir une référence distincte")
+        if set(req.documents)-set(ids):
+            raise HTTPException(422,'Une pièce ne correspond à aucun billet du groupe')
         result=[]
         for t in req.tickets:
-            result.append(issue_ticket(ConfirmRequest(ticket={**t,"bookingGroupId":req.bookingId}),c,u,db)["ticket"])
+            result.append(issue_ticket(ConfirmRequest(ticket={**t,"bookingGroupId":req.bookingId},document=req.documents.get(str(t['id']))),c,u,db)["ticket"])
         db.commit()
         return {"bookingId":req.bookingId,"tickets":result}
+
+    @app.post('/api/v2/transport/tickets/{ticket_id}/payments')
+    def settle_ticket(ticket_id:str,req:TicketPaymentRequest,token=Depends(auth),db=Depends(session)):
+        c,u=access(db,token,'sales',True)
+        t=get(db,c.id,'tickets',ticket_id)
+        payment_id='ticket-payment-'+req.id
+        previous=db.get(Entity,{'company_id':c.id,'entity_type':'ticket_payments','entity_id':payment_id})
+        if previous:
+            p=previous.payload
+            if p.get('ticketId')!=ticket_id or p.get('amount')!=req.amount or p.get('paymentMethod')!=req.paymentMethod or p.get('createdBy')!=u.id:
+                raise HTTPException(409,'Référence de règlement déjà utilisée')
+            db.commit();return {'ticket':t,'payment':p}
+        if not active(t) or t.get('boarded') or t.get('packId'):
+            raise HTTPException(409,'Ce billet ne peut plus recevoir de règlement')
+        if req.amount>float(t.get('balance') or 0) or req.paymentMethod!=t.get('paymentMethod','Espèces'):
+            raise HTTPException(422,'Respectez le solde et le mode de paiement initial du billet')
+        p=put(db,c.id,'ticket_payments',{'id':payment_id,'ticketId':ticket_id,**req.model_dump(exclude={'id'}),'tripId':t['tripId'],'createdBy':u.id,'createdByName':u.name,'agency':u.agency,'createdAt':now().isoformat()})
+        paid=round(float(t.get('paid') or 0)+req.amount,2)
+        t=put(db,c.id,'tickets',{**t,'paid':paid,'balance':round(float(t['fare'])-paid,2)})
+        audit(db,c,u,'Solde billet encaissé',ticket_id);db.commit()
+        return {'ticket':t,'payment':p}
 
     @app.post("/api/v2/transport/tickets/{ticket_id}/refund")
     def refund(ticket_id: str, req: RefundRequest, token=Depends(auth), db=Depends(session)):
@@ -595,6 +631,11 @@ def install(app, env):
         c,u=access(db,token,"dispatch",True)
         tr=get(db,c.id,"ticket_trips",trip_id)
         bus=get(db,c.id,"ticket_buses",req.busId)
+        if 'check_vehicle_availability' in env:
+            from .extensions import legacy_trip_time
+            start=legacy_trip_time(tr['departureAt'])
+            end=legacy_trip_time(tr['expectedArrivalAt']) if tr.get('expectedArrivalAt') else start+timedelta(minutes=int(tr.get('durationMinutes') or 240))
+            env['check_vehicle_availability'](db,c.id,req.busId,start,end,trip_id)
         if tr.get("status") in {"Annulé","Terminé","Arrivé"} or bus.get("active") is False or bus.get("status") in {"En panne","Maintenance","Indisponible"}:
             raise HTTPException(409,"Départ ou bus indisponible")
         labels={str(s.get("label")):s for s in bus_seats(bus)}
@@ -635,6 +676,11 @@ def install(app, env):
             if existing:
                 result.append(existing.payload)
                 continue
+            if 'check_vehicle_availability' in env:
+                from .extensions import legacy_trip_time
+                aware=legacy_trip_time(at.isoformat())
+                end=aware+timedelta(minutes=int(tr.get('durationMinutes') or 240))
+                env['check_vehicle_availability'](db,c.id,tr['busId'],aware,end)
             # Explicit allowlist prevents copying arrival/manifest/dispatch state.
             copy={k:tr[k] for k in ("routeId","busId","origin","destination","stops","boardingPoint","dropPoint","fareSimple","fareVip","fareChildSimple","fareChildVip","capacityOverride","driver","conductor","driverId","conductorId","cargoCapacityKg","cargoCapacityCount") if k in tr}
             result.append(put(db,c.id,"ticket_trips",{**copy,"id":ident,"departureAt":at.isoformat(),"status":"Planifié","repeatSourceId":trip_id,"createdAt":now().isoformat(),"createdBy":u.id}))

@@ -1,5 +1,7 @@
 import { allocationActive, isoLocal, segmentFare } from './transport-model.js';
 import './transport.css';
+import { readIdentityDocument } from './document-reader.js';
+import { documentNumberKind } from './identity-text.js';
 
 export function createTransportUi(ctx) {
   const {state, esc, money, uid, now, persist, render, shell, notify, ticketRole, navigatePage} = ctx;
@@ -16,7 +18,7 @@ export function createTransportUi(ctx) {
   }
   async function synced() {
     if(!await ctx.sync())throw new Error('Synchronisez YamTrans avec le serveur avant cette opération');
-    if(state.syncStatus==='conflict')throw new Error('Résolvez les conflits de synchronisation avant cette opération');
+    // Conflicting records are archived individually; every new operation is validated by its server endpoint.
   }
   async function load() {
     serverData=null;
@@ -99,7 +101,7 @@ export function createTransportUi(ctx) {
     if(!tr||!host)return notify('Choisissez le départ aller.','warning');
     const returns=state.ticketTrips.filter(t=>t.id!==tr.id&&t.origin===tr.destination&&t.destination===tr.origin&&new Date(t.departureAt)>new Date(tr.departureAt));
     host.innerHTML=`<div class="modal-backdrop"><form id="transportGroupForm" class="modal wide-modal settings-form no-wizard"><div class="modal-head"><div><h3>Groupe / aller-retour</h3><p>${esc(tr.origin)} → ${esc(tr.destination)}</p></div><button type="button" id="closeTransportGroup">×</button></div><label>Retour facultatif<select name="returnTrip"><option value="">Aller simple</option>${returns.map(r=>`<option value="${esc(r.id)}">${esc(new Date(r.departureAt).toLocaleString('fr-FR'))} · ${esc(r.origin)} → ${esc(r.destination)}</option>`).join('')}</select></label><p>Chaque personne a son billet et son siège. Tous les billets sont validés ensemble, ou aucun ne l’est.</p><div id="groupTravelers"></div><button type="button" id="addGroupTraveler">Ajouter un passager</button><label>Mode de paiement<select name="paymentMethod"><option>Espèces</option><option>Mobile Money</option><option>Carte</option><option>Virement</option></select></label><p id="groupTotal" class="transport-good"></p><p>Le montant total doit avoir été encaissé avant validation. Cette action enregistre le règlement.</p><button class="primary" type="submit">Valider tous les billets</button></form></div>`;
-    const f=host.querySelector('form'),travelers=f.querySelector('#groupTravelers');
+    const f=host.querySelector('form'),travelers=f.querySelector('#groupTravelers'),identity=new WeakMap();
     const seats=trip=>ctx.busSeats(state.ticketBuses.find(b=>b.id===trip?.busId));
     const opts=trip=>'<option value="">Choisir un siège</option>'+seats(trip).map(s=>`<option value="${esc(s.label)}">${esc(s.label)} · ${esc(s.class)}</option>`).join('');
     const ret=()=>state.ticketTrips.find(t=>t.id===f.elements.returnTrip.value);
@@ -116,13 +118,16 @@ export function createTransportUi(ctx) {
       const row=document.createElement('div');row.className='group-traveler grid';
       row.innerHTML=`<label>Passager<input name="passengerName" required></label><label>Téléphone<input name="phone" required></label><label>Siège aller<select name="outSeat" required>${opts(tr)}</select></label><label>Siège retour<select name="backSeat" ${ret()?'required':'disabled'}>${opts(ret())}</select></label><button type="button" class="remove-traveler">Retirer ce passager</button>`;
       row.querySelector('button').onclick=()=>{if(travelers.children.length>1){row.remove();total();}};
+      const card=document.createElement('section');card.className='identity-sale-card';card.innerHTML='<button type="button" class="groupCamera">Photographier la pièce (facultatif)</button><label>CNIB B… / passeport A…<input name="groupDocumentNumber" autocomplete="off"></label><label><input type="checkbox" name="groupDocumentConfirmed">Pièce et numéro vérifiés</label><p role="status"></p>';row.append(card);
+      card.querySelector('.groupCamera').onclick=async e=>{const b=e.currentTarget;b.disabled=true;const status=card.querySelector('[role=status]');try{const value=await readIdentityDocument({source:'camera'},image=>ctx.identityOcr(image));if(!row.isConnected)return;identity.set(row,value);card.querySelector('[name=groupDocumentNumber]').value=value.primaryNumber;card.querySelector('[name=groupDocumentConfirmed]').checked=false;if(value.customerName&&!row.querySelector('[name=passengerName]').value)row.querySelector('[name=passengerName]').value=value.customerName;status.textContent=value.warning||'Photo prise. Vérifiez le numéro proposé.';}catch(e){status.textContent=e.message;}finally{b.disabled=false;}};
+      card.querySelector('[name=groupDocumentNumber]').oninput=()=>card.querySelector('[name=groupDocumentConfirmed]').checked=false;
       row.onchange=total;travelers.appendChild(row);total();
     }
     f.elements.returnTrip.onchange=()=>{for(const row of travelers.children){const sel=row.querySelector('[name="backSeat"]');sel.innerHTML=opts(ret());sel.disabled=!ret();sel.required=!!ret();}total();};
     f.querySelector('#addGroupTraveler').onclick=add;add();
     f.querySelector('#closeTransportGroup').onclick=()=>host.innerHTML='';
     f.onsubmit=e=>{e.preventDefault();run(f.querySelector('button.primary'),async()=>{
-      await synced();const items=[];
+      await synced();const items=[],documents={};
       for(const row of travelers.children){
         const passengerName=row.querySelector('[name="passengerName"]').value.trim(),phone=ctx.normalizePhone(row.querySelector('[name="phone"]').value);
         for(const [field,trip] of [['outSeat',tr],['backSeat',ret()]]){
@@ -130,10 +135,12 @@ export function createTransportUi(ctx) {
           const seat=seats(trip).find(s=>String(s.label)===row.querySelector('[name="'+field+'"]').value);
           if(!seat)throw new Error('Choisissez tous les sièges');
           const fare=segmentFare(state.ticketRoutes.find(r=>r.id===trip.routeId),trip,trip.origin,trip.destination,seat.class);
-          items.push({id:uid(),pnr:ctx.pnr(),publicToken:uid(),tripId:trip.id,passengerName,phone,seat:seat.label,seatClass:seat.class,boardingPoint:trip.origin,dropPoint:trip.destination,fare,paid:fare,discount:0,paymentMethod:f.elements.paymentMethod.value});
+          const ticketId=uid(),piece=identity.get(row),number=row.querySelector('[name=groupDocumentNumber]').value.trim().toUpperCase().replace(/[\s-]/g,'');
+          if(piece||number){if(!piece?.image||!documentNumberKind(number)||!row.querySelector('[name=groupDocumentConfirmed]').checked)throw new Error('Photographiez et vérifiez la pièce de chaque passager concerné.');documents[ticketId]={photo:piece.image,kind:documentNumberKind(number),number};}
+          items.push({id:ticketId,documentNumber:number,pnr:ctx.pnr(),publicToken:uid(),tripId:trip.id,passengerName,phone,seat:seat.label,seatClass:seat.class,boardingPoint:trip.origin,dropPoint:trip.destination,fare,paid:fare,discount:0,paymentMethod:f.elements.paymentMethod.value});
         }
       }
-      const result=await api('/bookings/confirm',{bookingId:uid(),tickets:items});
+      const result=await api('/bookings/confirm',{bookingId:uid(),tickets:items,documents});
       result.tickets.forEach(t=>replace('tickets',t));persist();
       host.innerHTML=`<div class="modal-backdrop"><div class="modal"><div class="modal-head"><h3>${result.tickets.length} billet(s) émis</h3><button id="closeGroupResult">×</button></div><div class="compact-list">${result.tickets.map(t=>`<div><b>${esc(t.passengerName)} · ${esc(t.pnr)}</b><span>${esc(t.origin)} → ${esc(t.destination)} · siège ${esc(t.seat)}</span><button data-group-ticket="${esc(t.id)}">Ouvrir / imprimer</button></div>`).join('')}</div></div></div>`;
       host.querySelector('#closeGroupResult').onclick=()=>{host.innerHTML='';render();};
@@ -142,7 +149,16 @@ export function createTransportUi(ctx) {
   }
   function enhanceTicket(id) {
     const t=state.tickets.find(t=>t.id===id),host=document.querySelector('#ticketModal')||document.querySelector('#fullMenuHost'),actions=host?.querySelector('.modal-actions');
-    if(!t||!actions||!allocationActive(t)||t.boarded||!ticketRole('manager'))return;
+    if(!t||!actions||!allocationActive(t)||t.boarded)return;
+    if(ticketRole('sales')&&Number(t.balance)>0&&!t.packId&&!actions.querySelector('[data-settle-ticket]')){
+      const settle=document.createElement('button');settle.dataset.settleTicket=id;settle.className='primary';settle.textContent='Régler le solde · '+money(t.balance);actions.append(settle);
+      settle.onclick=()=>{
+        const modal=host.querySelector('.modal');if(modal.querySelector('#ticketPaymentForm'))return;
+        modal.insertAdjacentHTML('beforeend',`<form id="ticketPaymentForm" class="settings-form no-wizard"><h4>Règlement du billet</h4><p>Mode initial : ${esc(t.paymentMethod||'Espèces')}. Enregistrez le montant après l’avoir encaissé.</p><label>Montant encaissé<input type="number" name="amount" min="0.01" step="0.01" max="${Number(t.balance)}" value="${Number(t.balance)}" required></label><button class="primary" type="submit">Confirmer le règlement</button></form>`);
+        const f=modal.querySelector('#ticketPaymentForm'),paymentId=uid();f.onsubmit=e=>{e.preventDefault();run(f.querySelector('button'),async()=>{const result=await api('/tickets/'+encodeURIComponent(id)+'/payments',{id:paymentId,amount:Number(f.elements.amount.value),paymentMethod:t.paymentMethod||'Espèces'});replace('tickets',result.ticket);persist();render();ctx.openTicket(id);});};
+      };
+    }
+    if(!ticketRole('manager'))return;
     if(actions.querySelector('[data-refund-ticket]'))return;const b=document.createElement('button');b.dataset.refundTicket=id;b.textContent='Annuler / rembourser';actions.appendChild(b);
     b.onclick=()=>{
       const modal=host.querySelector('.modal');

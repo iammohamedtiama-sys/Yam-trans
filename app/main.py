@@ -9,6 +9,9 @@ import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+from types import SimpleNamespace
+from .permissions import allowed as action_allowed, normalize as normalize_permissions, sync_actions, install as install_permissions
+from .management import install as install_management
 from urllib.parse import quote_plus
 from urllib import request as urlrequest, error as urlerror
 
@@ -20,6 +23,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy import Boolean, DateTime, Integer, JSON, String, Text, UniqueConstraint, create_engine, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 from .operations import install as install_operations
+from .extensions import install as install_extensions
+from .gps import install as install_gps
 from .transport import install as install_transport, lock_company, READ_ONLY_TYPES, active as transport_active
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./yamtrans-sync.db")
@@ -109,7 +114,7 @@ with engine.begin() as conn:
     except Exception:
         try: conn.execute(text("ALTER TABLE app_users_v3 ADD COLUMN modules JSON"))
         except Exception: pass
-app = FastAPI(title="YAM TRANS Multi-Sociétés · Courrier & Billetterie", version="4.8.2")
+app = FastAPI(title="YAM TRANS Multi-Sociétés · Courrier & Billetterie", version="4.11.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -405,6 +410,22 @@ def require_company(token: dict[str, Any], db: Session) -> Company:
     return company
 
 
+def resolve_company_user(token: dict[str, Any], db: Session):
+    """Resolve the operational actor after validating the live account and tenant."""
+    company = require_company(token, db)
+    uid = str(token.get("uid") or "")
+    if uid.startswith("platform:"):
+        # require_company verifies the real platform administrator, its active
+        # state and the company encoded in this delegated session on every call.
+        return company, SimpleNamespace(
+            id=uid, company_id=company.id, username="platform-admin",
+            name="Super Admin Plateforme", role="company_admin", agency="Toutes",
+            active=True, modules={"courier": True, "tickets": True,
+                "ticketRoles": ["sales", "boarding", "dispatch", "driver", "reports", "manager"]},
+        )
+    return company, db.get(AppUser, uid)
+
+
 def entity_id_for(payload: dict[str, Any]) -> str:
     return str(payload.get("id") or payload.get("phone") or payload.get("code") or "").strip()
 
@@ -548,7 +569,7 @@ def agency_public_info(db: Session, company_id: str, name: str) -> dict[str, str
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "transport-multitenant-sync", "version": "4.8.2", "time": utcnow().isoformat()}
+    return {"status": "ok", "service": "transport-multitenant-sync", "version": "4.11.1", "time": utcnow().isoformat()}
 
 
 @app.post("/api/v2/auth/login")
@@ -711,6 +732,7 @@ def shipment_destination_allowed(db: Session, company_id: str, payload: dict[str
 def sync_v2(req: SyncRequest, token: dict[str, Any] = Depends(read_token), db: Session = Depends(db_session)):
     lock_company(db, Company, token.get("cid"))
     company = require_company(token, db)
+    _, sync_actor = resolve_company_user(token, db)
     conflicts: list[dict[str, Any]] = []
     rejected_duplicate_ids: list[str] = []
     duplicate_map: dict[str, str] = {}
@@ -746,6 +768,26 @@ def sync_v2(req: SyncRequest, token: dict[str, Any] = Depends(read_token), db: S
             if req.deviceId and not payload.get("_deviceId"):
                 payload["_deviceId"] = req.deviceId
             current = db.get(EntityV3, {"company_id": company.id, "entity_type": entity_type, "entity_id": entity_id})
+            if isinstance((sync_actor.modules or {}).get('permissions'),dict):
+                old=dict(current.payload or {}) if current is not None else None
+                clean=lambda p:{k:v for k,v in (p or {}).items() if not k.startswith('_') and k not in {'updatedAt','companyId'}}
+                if clean(payload)!=clean(old):
+                    needed=sync_actions(entity_type,payload,old)
+                    if not all(action_allowed(sync_actor,a) for a in needed):
+                        conflicts.append({'type':'action_forbidden','entityType':entity_type,'id':entity_id,'detail':'Action non autorisée : '+', '.join(sorted(needed))});continue
+                    if payload.get('payrollId') or (old or {}).get('payrollId'):
+                        conflicts.append({'type':'payroll_server_required','entityType':entity_type,'id':entity_id});continue
+                    if (sync_actor.modules or {}).get('profile') in {'driver','conductor'} and payload.get('tripId'):
+                        trip=db.get(EntityV3,{'company_id':company.id,'entity_type':'ticket_trips','entity_id':payload['tripId']})
+                        if not trip or sync_actor.id not in {trip.payload.get('driverId'),trip.payload.get('conductorId')}:
+                            conflicts.append({'type':'assignment_required','entityType':entity_type,'id':entity_id});continue
+                    if not old:payload['createdBy']=sync_actor.id
+            if entity_type in {'customers','ticket_customers'} and payload.get('birthDate'):
+                from .operations import DocumentRequest
+                try: DocumentRequest.valid_birth_date(str(payload['birthDate']))
+                except ValueError:
+                    conflicts.append({'type':'birth_date_invalid','entityType':entity_type,'id':entity_id,'message':'Date de naissance invalide ou future'})
+                    continue
             incoming_version = int(payload.get("_serverVersion") or 0)
 
             alias = known_aliases.get((entity_type, entity_id))
@@ -797,6 +839,19 @@ def sync_v2(req: SyncRequest, token: dict[str, Any] = Depends(read_token), db: S
                 except HTTPException as exc:
                     conflicts.append({"type":"crew_invalid","entityType":entity_type,"id":entity_id,"message":str(exc.detail)})
                     continue
+            if entity_type == 'ticket_trips' and payload.get('busId') and payload.get('status') not in {'Annulé','Terminé','Arrivé','Clôturé'}:
+                previous_trip = dict(current.payload or {}) if current else {}
+                if current is None or any(payload.get(k) != previous_trip.get(k) for k in ('busId','departureAt','expectedArrivalAt','durationMinutes')):
+                    try:
+                        from .extensions import legacy_trip_time
+                        start = legacy_trip_time(payload.get('departureAt'))
+                        end = legacy_trip_time(payload['expectedArrivalAt']) if payload.get('expectedArrivalAt') else start + timedelta(minutes=int(payload.get('durationMinutes') or 240))
+                        if end <= start:
+                            raise HTTPException(422, 'La fin du voyage doit suivre le départ')
+                        check_vehicle_availability(db, company.id, payload['busId'], start, end, entity_id)
+                    except (HTTPException, ValueError, TypeError) as exc:
+                        conflicts.append({'type':'vehicle_conflict','entityType':entity_type,'id':entity_id,'message':str(exc.detail) if isinstance(exc,HTTPException) else 'Durée de voyage invalide'})
+                        continue
             if entity_type == "tickets" and current is None and _num(payload.get("discount")) != 0:
                 conflicts.append({"type":"discount_disabled","entityType":entity_type,"id":entity_id,"message":"Les remises sont désactivées au guichet"})
                 continue
@@ -832,6 +887,10 @@ def sync_v2(req: SyncRequest, token: dict[str, Any] = Depends(read_token), db: S
                     continue
                 if previous.get("refundId") and any(payload.get(k) != previous.get(k) for k in ("status", "refundId", "refundedAmount", "paid", "fare")):
                     conflicts.append({"type":"refund_protected", "entityType":entity_type, "id":entity_id, "message":"Un remboursement validé ne peut pas être modifié par synchronisation"})
+                    continue
+                protected_ticket_fields=('fare','paid','balance','paymentMethod','packId','customerId','documentNumber','boarded','boardedAt','boardedBy','status')
+                if any(payload.get(k)!=previous.get(k) for k in protected_ticket_fields):
+                    conflicts.append({'type':'ticket_server_required','entityType':entity_type,'id':entity_id,'message':'Le prix, les règlements, la pièce et l’embarquement doivent être confirmés par le serveur'})
                     continue
             if entity_type == "tickets" and payload.get("confirmationSource") == "offline" and payload.get("status") == "À synchroniser":
                 payload["status"] = "Confirmé"
@@ -914,6 +973,16 @@ def sync_v2(req: SyncRequest, token: dict[str, Any] = Depends(read_token), db: S
             if creator and creator in user_names:
                 p["_createdByName"] = user_names[creator]
             result[row.entity_type].append(p)
+    if isinstance((sync_actor.modules or {}).get('permissions'),dict):
+        for kind in list(result):
+            family='tickets' if kind.startswith(('ticket','loyalty')) else 'courier' if kind in {'shipments','customers','payments','withdrawals','manifests'} else None
+            if family and not any(action_allowed(sync_actor,a) for a in ({'tickets':['tickets.view','tickets.sell','tickets.board','trips.view'],'courier':['courier.view','courier.create']}[family])):result[kind]=[]
+            if kind=='ticket_baggage' and not any(action_allowed(sync_actor,a) for a in ('baggage.view','baggage.create')):result[kind]=[]
+            if kind=='expenses' and not action_allowed(sync_actor,'reports.view'):result[kind]=[]
+        if (sync_actor.modules or {}).get('profile') in {'driver','conductor'}:
+            assigned={t['id'] for t in result.get('ticket_trips',[]) if sync_actor.id in {t.get('driverId'),t.get('conductorId')}}
+            for kind in ('tickets','ticket_reservations','ticket_baggage','ticket_boardings'):result[kind]=[p for p in result[kind] if p.get('tripId') in assigned]
+            result['ticket_trips']=[p for p in result['ticket_trips'] if p['id'] in assigned]
     users = [user_public(u) for u in all_users if u.active]
     return {"serverTime": utcnow().isoformat(), "company": company_public(company), "users": users,
             "conflicts": conflicts, "rejectedDuplicateIds": rejected_duplicate_ids, "duplicateMap":duplicate_map,
@@ -925,7 +994,7 @@ def admin_bootstrap(token: dict[str, Any] = Depends(read_token), db: Session = D
     if token.get("role") == "platform_admin":
         return {"companies": [company_public(c, include_logo=False) for c in db.scalars(select(Company).order_by(Company.name)).all()]}
     company = require_company(token, db)
-    if token.get("role") not in {"company_admin", "superuser", "admin"}:
+    if token.get("role") not in {"company_admin", "superuser", "admin"} and not action_allowed(resolve_company_user(token,db)[1],"users.manage"):
         raise HTTPException(403, "Droits administrateur requis")
     users = [user_public(u) for u in db.scalars(select(AppUser).where(AppUser.company_id == company.id)).all()]
     return {"company": company_public(company), "users": users}
@@ -1163,9 +1232,9 @@ def platform_update_user(company_id: str, user_id: str, req: PlatformUserUpdateR
         if len(req.newPassword) < 6: raise HTTPException(400, "Le nouveau mot de passe doit contenir au moins 6 caractères")
         user.password_hash = password_hash(req.newPassword)
     if req.modules is not None:
-        cm=dict((company.settings or {}).get("modules") or {"courier":True,"baggage":True,"tickets":False}); mods=dict(req.modules or {})
+        cm=dict((company.settings or {}).get("modules") or {"courier":True,"baggage":True,"tickets":False}); mods=normalize_permissions(req.modules or {})
         mods["courier"]=bool(mods.get("courier")) and bool(cm.get("courier")); mods["baggage"]=bool(mods.get("baggage",True)) and bool(cm.get("baggage",True)); mods["tickets"]=bool(mods.get("tickets")) and bool(cm.get("tickets"))
-        mods["ticketRoles"]=[x for x in (mods.get("ticketRoles") or []) if x in {"sales","boarding","dispatch","driver","manager","reports"}]
+        mods["ticketRoles"]=[x for x in (mods.get("ticketRoles") or []) if x in {"sales","boarding","dispatch","driver","manager","reports","conductor"}]
         user.modules=mods
     db.commit()
     return user_public(user)
@@ -1263,13 +1332,16 @@ def create_user(req: UserCreateRequest, token: dict[str, Any] = Depends(read_tok
             raise HTTPException(404, "Société introuvable")
     else:
         company = require_company(token, db)
-        if token.get("role") not in {"company_admin", "superuser", "admin"}:
+        if token.get("role") not in {"company_admin", "superuser", "admin"} and not action_allowed(resolve_company_user(token,db)[1],"users.manage"):
             raise HTTPException(403, "Droits administrateur requis")
     if db.scalar(select(AppUser).where(AppUser.company_id == company.id, AppUser.username == req.username.strip())):
         raise HTTPException(409, "Cet identifiant existe déjà dans cette société")
+    if token.get('role')=='agency':
+        actor=resolve_company_user(token,db)[1]
+        if req.role!='agency' or not isinstance(req.modules.get('permissions'),dict) or any(value and not action_allowed(actor,key) for key,value in req.modules['permissions'].items()):raise HTTPException(403,'Vous ne pouvez accorder que vos propres actions à un compte agent')
     role = req.role if req.role in {"agency", "admin", "company_admin", "superuser"} else "agency"
-    cm=dict((company.settings or {}).get("modules") or {"courier":True,"baggage":True,"tickets":False}); mods=dict(req.modules or {})
-    mods["courier"]=bool(mods.get("courier")) and bool(cm.get("courier")); mods["baggage"]=bool(mods.get("baggage",True)) and bool(cm.get("baggage",True)); mods["tickets"]=bool(mods.get("tickets")) and bool(cm.get("tickets")); mods["ticketRoles"]=[x for x in (mods.get("ticketRoles") or []) if x in {"sales","boarding","dispatch","driver","manager","reports"}]
+    cm=dict((company.settings or {}).get("modules") or {"courier":True,"baggage":True,"tickets":False}); mods=normalize_permissions(req.modules or {})
+    mods["courier"]=bool(mods.get("courier")) and bool(cm.get("courier")); mods["baggage"]=bool(mods.get("baggage",True)) and bool(cm.get("baggage",True)); mods["tickets"]=bool(mods.get("tickets")) and bool(cm.get("tickets")); mods["ticketRoles"]=[x for x in (mods.get("ticketRoles") or []) if x in {"sales","boarding","dispatch","driver","manager","reports","conductor"}]
     user = AppUser(id=str(uuid.uuid4()), company_id=company.id, username=req.username.strip(), name=req.name.strip(),
                    password_hash=password_hash(req.password), role=role, agency=req.agency or "Toutes", active=True, modules=mods, created_at=utcnow())
     db.add(user); db.commit()
@@ -1280,13 +1352,17 @@ def create_user(req: UserCreateRequest, token: dict[str, Any] = Depends(read_tok
 def update_company_user(user_id: str, req: PlatformUserUpdateRequest, token: dict[str, Any] = Depends(read_token), db: Session = Depends(db_session)):
     company = require_company(token, db)
     actor_role = token.get("role")
-    if actor_role not in {"company_admin", "superuser", "admin"}:
+    if actor_role not in {"company_admin", "superuser", "admin"} and not action_allowed(resolve_company_user(token,db)[1],"users.manage"):
         raise HTTPException(403, "Droits administrateur requis")
     user = db.get(AppUser, user_id)
     if not user or user.company_id != company.id:
         raise HTTPException(404, "Utilisateur introuvable")
     if actor_role == "admin" and user.role in {"company_admin", "superuser"}:
         raise HTTPException(403, "Cet administrateur ne peut pas modifier ce compte")
+    if actor_role=='agency':
+        actor=resolve_company_user(token,db)[1]
+        if user.role!='agency' or (req.role and req.role!='agency'):raise HTTPException(403,'Compte privilégié réservé aux administrateurs')
+        if req.modules is not None and (not isinstance(req.modules.get('permissions'),dict) or any(value and not action_allowed(actor,key) for key,value in req.modules['permissions'].items())):raise HTTPException(403,'Vous ne pouvez accorder que vos propres actions')
     if req.username.strip() and req.username.strip() != user.username:
         exists = db.scalar(select(AppUser).where(AppUser.company_id == company.id, AppUser.username == req.username.strip(), AppUser.id != user.id))
         if exists:
@@ -1305,9 +1381,9 @@ def update_company_user(user_id: str, req: PlatformUserUpdateRequest, token: dic
             raise HTTPException(400, "Le nouveau mot de passe doit contenir au moins 6 caractères")
         user.password_hash = password_hash(req.newPassword)
     if req.modules is not None:
-        cm=dict((company.settings or {}).get("modules") or {"courier":True,"baggage":True,"tickets":False}); mods=dict(req.modules or {})
+        cm=dict((company.settings or {}).get("modules") or {"courier":True,"baggage":True,"tickets":False}); mods=normalize_permissions(req.modules or {})
         mods["courier"]=bool(mods.get("courier")) and bool(cm.get("courier")); mods["baggage"]=bool(mods.get("baggage",True)) and bool(cm.get("baggage",True)); mods["tickets"]=bool(mods.get("tickets")) and bool(cm.get("tickets"))
-        mods["ticketRoles"]=[x for x in (mods.get("ticketRoles") or []) if x in {"sales","boarding","dispatch","driver","manager","reports"}]
+        mods["ticketRoles"]=[x for x in (mods.get("ticketRoles") or []) if x in {"sales","boarding","dispatch","driver","manager","reports","conductor"}]
         user.modules=mods
     db.commit()
     return user_public(user)
@@ -1316,11 +1392,12 @@ def update_company_user(user_id: str, req: PlatformUserUpdateRequest, token: dic
 @app.delete("/api/v2/admin/users/{user_id}")
 def delete_user(user_id: str, token: dict[str, Any] = Depends(read_token), db: Session = Depends(db_session)):
     company = require_company(token, db)
-    if token.get("role") not in {"company_admin", "superuser", "admin"}:
+    if token.get("role") not in {"company_admin", "superuser", "admin"} and not action_allowed(resolve_company_user(token,db)[1],"users.manage"):
         raise HTTPException(403, "Droits administrateur requis")
     u = db.get(AppUser, user_id)
     if not u or u.company_id != company.id:
         raise HTTPException(404, "Utilisateur introuvable")
+    if token.get("role")=="agency" and u.role!="agency":raise HTTPException(403,"Compte privilégié réservé aux administrateurs")
     u.active = False; db.commit()
     return {"ok": True}
 
@@ -1328,7 +1405,7 @@ def delete_user(user_id: str, token: dict[str, Any] = Depends(read_token), db: S
 @app.put("/api/v2/admin/company/profile")
 def update_company_profile(req: CompanyProfileRequest, token: dict[str, Any] = Depends(read_token), db: Session = Depends(db_session)):
     company = require_company(token, db)
-    if token.get("role") not in {"company_admin", "superuser", "admin"}:
+    if token.get("role") not in {"company_admin", "superuser", "admin"} and not action_allowed(resolve_company_user(token,db)[1],"settings.manage"):
         raise HTTPException(403, "Droits administrateur requis")
     if req.name: company.name = req.name.strip()
     if req.phone: company.phone = req.phone.strip()
@@ -1513,7 +1590,7 @@ def tracking_page(company: str = Query(default=DEFAULT_COMPANY_CODE), code: str 
 
 @app.get("/")
 def root():
-    return {"service": "Transport Multi-Sociétés", "version": "4.8.2", "health": f"{PUBLIC_BASE_URL}/health", "tracking": f"{PUBLIC_BASE_URL}/suivi?company={DEFAULT_COMPANY_CODE}&code=OUA-00001"}
+    return {"service": "Transport Multi-Sociétés", "version": "4.11.1", "health": f"{PUBLIC_BASE_URL}/health", "tracking": f"{PUBLIC_BASE_URL}/suivi?company={DEFAULT_COMPANY_CODE}&code=OUA-00001"}
 
 
 # Interface web complète : le même client que l'application Android, avec les mêmes rôles.
@@ -1546,3 +1623,8 @@ if os.path.isdir(WEBAPP_DIR):
 # Additive transport APIs; existing entities and routes remain available.
 install_transport(app, globals())
 install_operations(app, globals())
+install_extensions(app, globals())
+install_gps(app, globals())
+
+install_management(app, globals())
+install_permissions(app, globals())
