@@ -1,3 +1,4 @@
+from .manifest_guard import manifest_locked, LOCK_MESSAGE
 from .permissions import verified_action
 """Transport workflows over the existing tenant-scoped entity store.
 
@@ -344,6 +345,11 @@ def install(app, env):
             raise HTTPException(403,"Droit Courrier requis")
         tr=get(db,c.id,"ticket_trips",trip_id)
         manifest=get(db,c.id,"manifests",req.manifestId)
+        if manifest_locked(manifest):
+            if manifest.get('tripId') == trip_id:
+                return {'manifest':manifest,'shipments':[get(db,c.id,'shipments',ident) for ident in manifest.get('shipmentIds') or []]}
+            raise HTTPException(409, LOCK_MESSAGE)
+
         if manifest.get("tripId") and manifest["tripId"]!=trip_id:
             raise HTTPException(409,"Ce bordereau est déjà rattaché à un autre départ")
         span(tr,{"boardingPoint":manifest.get("origin"),"dropPoint":manifest.get("destination")})

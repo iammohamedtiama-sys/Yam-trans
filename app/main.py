@@ -1,3 +1,4 @@
+from .manifest_guard import manifest_locked, manifest_content, LOCK_MESSAGE
 import base64
 import hashlib
 import hmac
@@ -768,6 +769,23 @@ def sync_v2(req: SyncRequest, token: dict[str, Any] = Depends(read_token), db: S
             if req.deviceId and not payload.get("_deviceId"):
                 payload["_deviceId"] = req.deviceId
             current = db.get(EntityV3, {"company_id": company.id, "entity_type": entity_type, "entity_id": entity_id})
+            if entity_type == 'manifests' and current is not None and manifest_locked(current.payload):
+                if manifest_content(payload) != manifest_content(current.payload):
+                    conflicts.append({'type':'manifest_locked','entityType':entity_type,'id':entity_id,'message':LOCK_MESSAGE})
+                continue
+            if entity_type == 'shipments':
+                previous_manifest = str((current.payload or {}).get('manifestId') or '') if current else ''
+                requested_manifest = str(payload.get('manifestId') or '')
+                if previous_manifest != requested_manifest:
+                    sealed = False
+                    for manifest_id in {previous_manifest, requested_manifest} - {''}:
+                        manifest_row = db.get(EntityV3, {'company_id':company.id,'entity_type':'manifests','entity_id':manifest_id})
+                        if manifest_row is not None and manifest_locked(manifest_row.payload):
+                            sealed = True
+                    if sealed:
+                        conflicts.append({'type':'manifest_locked','entityType':entity_type,'id':entity_id,'message':LOCK_MESSAGE})
+                        continue
+
             if isinstance((sync_actor.modules or {}).get('permissions'),dict):
                 old=dict(current.payload or {}) if current is not None else None
                 clean=lambda p:{k:v for k,v in (p or {}).items() if not k.startswith('_') and k not in {'updatedAt','companyId'}}

@@ -37,3 +37,6 @@ body.seat-sheet-active .mobile-nav{visibility:hidden}
 .sync-review-button{font-size:12px;padding:6px 10px;min-height:36px;color:#8a4a08;background:#fff4df;border:1px solid #e9bd72}
 .sync-review-dialog{width:min(760px,100%)}.sync-review-card{border:1px solid #dce8e2;border-radius:14px;padding:16px;margin:14px 0}.sync-review-card pre{max-height:220px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;background:#f3f7f5;padding:12px;border-radius:8px}
 @media(max-width:760px){.workspace>header{padding-top:calc(12px + env(safe-area-inset-top,0px));align-items:start}.workspace>header .header-badges{align-self:start}.workspace>header p{margin:4px 0 0}.workspace>header h1{line-height:1.35}.sync-review-button{margin:2px 0}}
+
+/* A confirmed arrival seals the dispatch note; its edit action stays visibly disabled. */
+.manifest-list button[data-edit-manifest]:disabled,.manifest-list button[data-edit-manifest]:disabled:hover{background:#edf0f2!important;color:#89939c!important;border-color:#dce1e5!important;opacity:1;box-shadow:none!important;cursor:not-allowed;transform:none!important;filter:none!important}
