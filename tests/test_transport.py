@@ -601,3 +601,21 @@ def test_sales_cannot_bypass_fixed_tariffs_with_a_discounted_pack(setup):
     p={'id':'pack','customerName':'Client','phone':'70000001','routeId':'route','journeys':10,'amount':1,'expiresOn':(datetime.now(timezone.utc)+timedelta(days=90)).date().isoformat()}
     assert ops(sales,'/packs',p).status_code==403
     assert ops(sales,'/packs',{**p,'amount':50000}).status_code==200
+
+
+def test_historical_stop_spellings_hold_and_confirmation(setup):
+    h,_,_=setup
+    hold=post(h,'/holds',{'tripId':'trip','seat':'A1','boardingPoint':' OUAGA\u00a0','dropPoint':'BOBO','deviceId':'one'})
+    assert hold.status_code==200,hold.text
+    assert hold.json()['boardingPoint']=='Ouaga'
+    sale=post(h,'/tickets/confirm',{'ticket':ticket(boardingPoint='ouaga',dropPoint=' Bobo '),'holdId':hold.json()['id']})
+    assert sale.status_code==200,sale.text
+    assert sale.json()['ticket']['dropPoint']=='Bobo'
+    assert post(h,'/holds',{'tripId':'trip','seat':'A1','boardingPoint':'ouaga','dropPoint':'bobo','deviceId':'two'}).status_code==409
+
+
+def test_real_unknown_stop_remains_rejected(setup):
+    h,_,_=setup
+    result=post(h,'/holds',{'tripId':'trip','seat':'A1','boardingPoint':'Paris','dropPoint':'Bobo','deviceId':'one'})
+    assert result.status_code==422
+    assert 'Boromo' in result.json()['detail']

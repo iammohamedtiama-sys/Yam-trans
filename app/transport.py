@@ -1,3 +1,4 @@
+from .journey import journey_stops, journey_span, canonical_segment, stop_key
 from .manifest_guard import manifest_locked, LOCK_MESSAGE
 from .permissions import verified_action
 """Transport workflows over the existing tenant-scoped entity store.
@@ -34,22 +35,11 @@ def active(item):
 
 
 def stops_for(trip):
-    middle = trip.get("stops") or []
-    if isinstance(middle, str):
-        middle = middle.split(",")
-    return [str(x).strip() for x in [trip.get("origin"), *middle, trip.get("destination")] if str(x or "").strip()]
+    return journey_stops(trip)
 
 
-def span(trip, item):
-    stops = stops_for(trip)
-    try:
-        start = stops.index(str(item.get("boardingPoint") or trip.get("origin")))
-        end = stops.index(str(item.get("dropPoint") or trip.get("destination")))
-    except ValueError:
-        raise HTTPException(422, "Arrêt inconnu sur cette ligne")
-    if start >= end:
-        raise HTTPException(422, "La descente doit suivre l’embarquement")
-    return start, end
+def span(trip,item):
+    return journey_span(trip,item)
 
 
 def overlap(trip, a, b):
@@ -73,9 +63,13 @@ def route_fare(route, trip, payload, seat_class):
     """None preserves a historical route without a centrally configured tariff."""
     import re
     for line in re.split(r"[\n;]", str(route.get("segmentFares") or "")):
-        match = re.fullmatch(r"\s*(.+?)\s*>\s*(.+?)\s*=\s*([\d.]+)\s*,\s*([\d.]+)\s*", line)
-        if match and match[1].strip() == (payload.get("boardingPoint") or trip.get("origin")) and match[2].strip() == (payload.get("dropPoint") or trip.get("destination")):
-            return float(match[4 if seat_class == "VIP" else 3])
+        match = re.fullmatch(r"\s*(.+?)\s*>\s*(.+?)\s*=\s*([^,;]+)\s*,\s*([^,;]+)\s*", line)
+        if match and stop_key(match[1]) == stop_key(payload.get("boardingPoint") or trip.get("origin")) and stop_key(match[2]) == stop_key(payload.get("dropPoint") or trip.get("destination")):
+            try:
+                result=float(match[4 if seat_class == "VIP" else 3])
+                if not math.isfinite(result) or result<0:raise ValueError()
+                return result
+            except ValueError:raise HTTPException(422,'Tarif de tronçon invalide')
     adult = "fareVip" if seat_class == "VIP" else "fareSimple"
     key = ("fareChildVip" if seat_class == "VIP" else "fareChildSimple") if payload.get("passengerCategory") == "child" else adult
     value = route.get(key, route.get(adult, trip.get(key, trip.get(adult))))
@@ -183,6 +177,13 @@ class ManifestRequest(BaseModel):
     manifestId: str
 
 
+def boarding_day_allowed(departure, at):
+    if departure.tzinfo is None:departure=departure.replace(tzinfo=timezone.utc)
+    departure=departure.astimezone(timezone.utc);at=at.astimezone(timezone.utc)
+    # Preserve same-day operation and allow the preparation of a night departure.
+    return departure.date()==at.date() or abs((departure-at).total_seconds())<=4*3600
+
+
 def install(app, env):
     Entity, Company, User = env["EntityV3"], env["Company"], env["AppUser"]
     session, auth, now = env["db_session"], env["read_token"], env["utcnow"]
@@ -243,7 +244,7 @@ def install(app, env):
 
     def validate_seat(db, cid, payload, exclude_id="", reservation_id="", hold_id=""):
         trip = bookable(db, cid, payload["tripId"])
-        span(trip, payload)
+        payload.update(canonical_segment(trip,payload))
         bus = get(db, cid, "ticket_buses", str(trip.get("busId") or ""))
         labels = {str(x.get("label")) for x in bus_seats(bus)}
         if str(payload.get("seat")) not in labels:
@@ -289,7 +290,8 @@ def install(app, env):
             if existing.payload.get("createdBy")!=u.id:
                 raise HTTPException(403,"Réservation d’un autre agent")
             return existing.payload
-        tr=validate_seat(db,c.id,req.model_dump())
+        reservation_payload=req.model_dump()
+        tr=validate_seat(db,c.id,reservation_payload)
         validate_tariff(db,c.id,{**req.model_dump(),"fare":req.amount,"discount":0},False)
         try:
             expiry=datetime.fromisoformat(req.expiresAt.replace("Z","+00:00"))
@@ -304,7 +306,7 @@ def install(app, env):
             raise HTTPException(422,"L’expiration doit être future et précéder le départ")
         if req.deposit>req.amount:
             raise HTTPException(422,"L’acompte dépasse le tarif")
-        item=put(db,c.id,"ticket_reservations",{**req.model_dump(),"code":"RSV-"+req.id.replace("-","")[:10].upper(),"status":"Payée" if req.deposit>=req.amount else "Partiellement payée" if req.deposit else "Réservée","expiresAt":expiry.isoformat(),"createdBy":u.id,"createdByName":u.name,"agency":u.agency,"createdAt":now().isoformat()})
+        item=put(db,c.id,"ticket_reservations",{**reservation_payload,"code":"RSV-"+req.id.replace("-","")[:10].upper(),"status":"Payée" if req.deposit>=req.amount else "Partiellement payée" if req.deposit else "Réservée","expiresAt":expiry.isoformat(),"createdBy":u.id,"createdByName":u.name,"agency":u.agency,"createdAt":now().isoformat()})
         db.commit()
         return item
 
@@ -404,9 +406,11 @@ def install(app, env):
             reservation = get(db, c.id, "ticket_reservations", req.reservationId)
             if not active(reservation) or reservation.get("tripId") != t.get("tripId") or str(reservation.get("seat")) != str(t.get("seat")):
                 raise HTTPException(409, "Réservation expirée ou différente du billet")
+        current_trip=get(db,c.id,"ticket_trips",str(t['tripId']))
+        t.update(canonical_segment(current_trip,t))
         if req.holdId:
             h = get(db, c.id, "ticket_holds", req.holdId)
-            if h.get("createdBy") != u.id or not active(h) or any(str(h.get(k) or "") != str(t.get(k) or "") for k in ("tripId","seat","boardingPoint","dropPoint")):
+            if h.get("createdBy") != u.id or not active(h) or (any(str(h.get(k) or "") != str(t.get(k) or "") for k in ("tripId","seat")) or span(current_trip,h)!=span(current_trip,t)):
                 raise HTTPException(409, "Le blocage du siège a expiré ou a changé")
         trip = validate_seat(db, c.id, t, reservation_id=req.reservationId, hold_id=req.holdId)
         for field in ("fare", "paid", "discount"):
@@ -426,7 +430,7 @@ def install(app, env):
             raise HTTPException(422, "Le billet doit reprendre l’acompte déjà versé")
         if reservation and float(reservation.get("deposit") or 0)>0 and t.get("paymentMethod","Espèces")!=reservation.get("paymentMethod","Espèces"):
             raise HTTPException(422,"Le complément doit utiliser le même mode de paiement que l’acompte")
-        if reservation and any(str(reservation.get(k) or trip.get(default) or "")!=str(t.get(k) or trip.get(default) or "") for k,default in (("boardingPoint","origin"),("dropPoint","destination"))):
+        if reservation and span(trip,reservation)!=span(trip,t):
             raise HTTPException(422,"Le billet doit reprendre le tronçon de la réservation")
         bus=get(db,c.id,"ticket_buses",trip["busId"])
         seat=next(s for s in bus_seats(bus) if str(s.get("label"))==str(t["seat"]))
@@ -509,6 +513,8 @@ def install(app, env):
         audit(db,c,u,"Billet confirmé",str(t.get("pnr") or t["id"]))
         return {"ticket":t}
 
+    env["passenger_issue_ticket"]=issue_ticket
+
     @app.get("/api/v2/transport/tickets/{ticket_id}")
     def recover_ticket(ticket_id: str, token=Depends(auth), db=Depends(session)):
         c,u=access(db,token,"sales",True)
@@ -538,7 +544,7 @@ def install(app, env):
         trip=get(db,c.id,"ticket_trips",req.tripId)
         try: departure=datetime.fromisoformat(str(trip.get("departureAt") or '').replace('Z','+00:00'))
         except ValueError: raise HTTPException(422,"Date du départ invalide")
-        if departure.date()!=now().date():
+        if not boarding_day_allowed(departure,now()):
             raise HTTPException(409,"Ce billet concerne un autre jour : transfert requis")
         if trip.get("status") in {"Annulé","Terminé","Clôturé","Arrivé"}:
             raise HTTPException(409,"Embarquement fermé pour ce départ")

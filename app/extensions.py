@@ -1,3 +1,4 @@
+from .journey import canonical_segment
 from .permissions import verified_action
 """Native YamTrans extensions; no third-party application code is imported."""
 import hashlib
@@ -425,13 +426,14 @@ def install(app, env):
             if not trip.get('busId') or not str(trip.get('departureAt', '')).startswith(date) or legacy_trip_time(trip['departureAt']) <= now() or trip.get('status') not in {'Publié', 'Planifié', 'Opérations', 'Ouvert à la vente', 'Embarquement'}:
                 continue
             stops = stops_for(trip)
-            if origin not in stops or destination not in stops or stops.index(origin) >= stops.index(destination):
+            try:
+                segment = canonical_segment(trip, {'boardingPoint':origin,'dropPoint':destination})
+            except HTTPException:
                 continue
             bus = get(db, c.id, 'ticket_buses', trip['busId'])
             if bus.get('active') is False or bus.get('status') in {'Maintenance', 'En panne', 'Indisponible'}:
                 continue
             route = next((r for r in rows(db, c.id, 'ticket_routes') if r['id'] == trip.get('routeId')), {})
-            segment = {'boardingPoint': origin, 'dropPoint': destination}
             seats = []
             for seat in bus_seats(bus):
                 occupied = any(a.get('tripId') == trip['id'] and str(a.get('seat')) == str(seat['label']) and overlap(trip, segment, a) for a in allocations)
@@ -444,7 +446,7 @@ def install(app, env):
     @app.get('/api/v2/extensions/backup')
     def backup(token=Depends(auth), db=Depends(session)):
         c, u = access(db, token, {'manager'})
-        kinds = sorted({r.entity_type for r in db.scalars(select(Entity).where(Entity.company_id == c.id)).all()})
+        kinds = sorted({r.entity_type for r in db.scalars(select(Entity).where(Entity.company_id == c.id)).all() if not r.entity_type.startswith("passenger_")})
         # Company entities only; no authentication secrets or account password hashes.
         entities = {kind: rows(db, c.id, kind) for kind in kinds}
         for items in entities.values():

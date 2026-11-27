@@ -1,13 +1,23 @@
 {
   "name": "transfert-pos",
-  "version": "4.11.1",
+  "version": "4.12.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "android:add": "npx cap add android",
-    "android:sync": "npx cap sync android"
+    "android:sync": "npx cap sync android",
+    "desktop:start": "npm run build && electron .",
+    "desktop:windows": "npm run build && electron-builder --win --x64 --dir --publish never && node desktop/cleanup-build.cjs && electron-builder --win portable --x64 --prepackaged release-windows/win-unpacked --publish never && node desktop/build-installer.cjs",
+    "desktop:test": "node --test tests/desktop.test.cjs tests/transport-model.test.js tests/identity-text.test.js",
+    "desktop:smoke": "npm run build && node tests/electron-smoke.cjs",
+    "android:debug": "npm run build && cap sync android && node scripts/build-android.cjs",
+    "extensions:test": "node tests/extensions-dom.cjs",
+    "mobile:test": "node --test tests/mobile-ui.test.cjs",
+    "mobile:browser": "node tests/mobile-browser.cjs",
+    "passenger:build": "node scripts/build-passenger.cjs",
+    "passenger:test": "node tests/passenger-browser.cjs"
   },
   "dependencies": {
     "@capacitor/android": "8.4.2",
@@ -18,5 +28,63 @@
     "jsqr": "1.4.0",
     "qrcode": "1.5.4",
     "vite": "8.1.5"
+  },
+  "devDependencies": {
+    "electron": "44.8.0",
+    "electron-builder": "26.15.3",
+    "jsdom": "31.0.0",
+    "playwright": "1.65.0"
+  },
+  "main": "desktop/main.cjs",
+  "description": "Yam-Trans — billets, bagages et courrier",
+  "author": "Yam-Trans",
+  "build": {
+    "appId": "com.yamtrans.desktop",
+    "productName": "YAM TRANS",
+    "directories": {
+      "output": "release-windows",
+      "buildResources": "desktop"
+    },
+    "files": [
+      "dist/**/*",
+      "desktop/*.cjs",
+      "desktop/icon.png",
+      "package.json"
+    ],
+    "asar": true,
+    "npmRebuild": false,
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "desktop/icon.ico",
+      "artifactName": "YamTrans-${version}-Windows-${arch}.${ext}",
+      "signExecutable": false,
+      "signAndEditExecutable": false
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "YAM TRANS",
+      "deleteAppDataOnUninstall": false,
+      "installerLanguages": [
+        "fr_FR"
+      ],
+      "displayLanguageSelector": false,
+      "runAfterFinish": true,
+      "artifactName": "YamTrans-${version}-Windows-Installation.exe"
+    },
+    "portable": {
+      "artifactName": "YamTrans-${version}-Windows-Portable.exe",
+      "requestExecutionLevel": "user"
+    }
   }
 }

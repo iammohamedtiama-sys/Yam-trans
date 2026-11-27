@@ -1,4 +1,4 @@
-import { allocationActive, isoLocal, segmentFare } from './transport-model.js';
+import { allocationActive, isoLocal, segmentFare, journeySpan } from './transport-model.js';
 import './transport.css';
 import { readIdentityDocument } from './document-reader.js';
 import { documentNumberKind } from './identity-text.js';
@@ -182,7 +182,7 @@ export function createTransportUi(ctx) {
     if(holding)throw new Error('La réservation du siège précédent est en cours');
     if(!navigator.onLine){hold=null;notify('Mode hors connexion : la disponibilité entre agences sera vérifiée à la synchronisation.','warning',6000);return;}
     holding=true;
-    try {await synced();hold=await api('/holds',{tripId,seat,boardingPoint,dropPoint,deviceId:ctx.deviceId(),holdId:hold?.id||''});notify('Siège bloqué pendant 5 minutes sur les guichets connectés.','success');}
+    try {await synced();const current=state.ticketTrips.find(t=>t.id===tripId);if(!current)throw Error('Ce départ n’est plus disponible. Actualisez la liste.');const segment=journeySpan(current,boardingPoint,dropPoint);hold=await api('/holds',{tripId,seat,boardingPoint:segment.from,dropPoint:segment.to,deviceId:ctx.deviceId(),holdId:hold?.id||''});notify('Siège bloqué pendant 5 minutes sur les guichets connectés.','success');}
     finally {holding=false;}
   }
   async function confirmTicket(ticket,document=null) {
