@@ -17,6 +17,7 @@ def interpret(report):
     aggregate={'trips':[{'reference':f'Départ {i+1}',**{k:t[k] for k in ('departureAt','tickets','occupancyPct','cashIncome','prepaidAllocated','income','expenses','net')}} for i,t in enumerate(report['trips'][:150])],
         'crewWorkload':[{'reference':f'Agent {i+1}','weeklyTrips':p['weeklyTrips'],'alerts':p['alerts']} for i,p in enumerate(report['crew'])],
         'unallocatedExpenses':report['unallocatedExpenses'],'parkingIncome':report['parkingIncome'],'prepaidIncome':report['prepaidIncome']}
+    if 'management' in report:aggregate['management']=report['management']
     body={'model':model,'messages':[{'role':'system','content':'Tu aides une compagnie de transport. Réponds en français clair avec au plus 6 observations et actions à examiner. Utilise uniquement les chiffres fournis. Distingue encaissements et revenus de voyages prépayés pour ne pas les compter deux fois. Les coûts peuvent être incomplets. Ne conclus pas à une fraude ni à une fatigue médicale, ne recommande aucune sanction individuelle et ne prends aucune décision automatiquement. Les références sont anonymisées.'},{'role':'user','content':json.dumps(aggregate,ensure_ascii=False)}]}
     req=request.Request(endpoint,data=json.dumps(body).encode(),headers={'Authorization':'Bearer '+key,'Content-Type':'application/json'},method='POST')
     try:

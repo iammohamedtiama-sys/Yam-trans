@@ -1,14 +1,24 @@
+from .permissions import verified_action
 """Additive operational modules. Private data never enters public tracking views."""
 import math
 import secrets
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Literal
+from .extensions import legacy_trip_time
 from fastapi import Depends, HTTPException
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from .transport import lock_company
+
+def validate_document_number(kind, number):
+    import re
+    normalized = ''.join(str(number).upper().split()).replace('-', '')
+    prefix = {'CNIB': 'B', 'Passeport': 'A'}.get(kind)
+    if prefix and (not re.fullmatch(prefix + r'[A-Z0-9]{4,29}', normalized) or not any(c.isdigit() for c in normalized)):
+        raise HTTPException(422, 'Numéro incorrect : CNIB B… ou passeport A…')
+    return normalized
 
 PRIVATE_TYPES = {'parking', 'fleet_events', 'customer_documents', 'travel_packs', 'tracking_events', 'trip_shares'}
 
@@ -21,6 +31,7 @@ class ParkingRequest(BaseModel):
     condition: str = Field(min_length=1, max_length=1000)
     rate: float = Field(ge=0, allow_inf_nan=False)
     pricing: Literal['jour', 'forfait']
+    slotId: str = ''
 
 class ReleaseRequest(BaseModel):
     paid: float = Field(ge=0, allow_inf_nan=False)
@@ -54,6 +65,8 @@ class TrackingRequest(BaseModel):
     latitude: float | None = Field(default=None, ge=-90, le=90, allow_inf_nan=False)
     longitude: float | None = Field(default=None, ge=-180, le=180, allow_inf_nan=False)
     accuracy: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    speedKph: float | None = Field(default=None, ge=0, le=400, allow_inf_nan=False)
+    recordedAt: str = ''
 
 class OcrRequest(BaseModel):
     image: str = Field(max_length=7_000_000)
@@ -67,9 +80,23 @@ class DocumentRequest(BaseModel):
     kind: Literal['CNIB', 'Passeport', 'Autre']
     number: str = Field(min_length=3, max_length=100)
     expiresOn: str = ''
+    birthDate: str = Field(default='', max_length=10)
     replacesId: str = ''
     previousNumber: str = Field(default='',max_length=100)
     photo: str = Field(default='',max_length=7_000_000)
+
+    @field_validator('birthDate')
+    @classmethod
+    def valid_birth_date(cls, value):
+        if not value:
+            return value
+        try:
+            parsed = datetime.strptime(value, '%Y-%m-%d').date()
+        except ValueError:
+            raise ValueError('Date de naissance invalide')
+        if parsed.isoformat() != value or parsed.year < 1900 or parsed > datetime.now(timezone.utc).date():
+            raise ValueError('Date de naissance invalide ou future')
+        return value
 
 class PackRequest(BaseModel):
     id: str = Field(min_length=1, max_length=120)
@@ -118,13 +145,11 @@ def install(app, env):
 
     def access(db,token,role='dispatch',write=False):
         if write: lock_company(db,Company,token.get('cid'))
-        c=env['require_company'](token,db);u=db.get(User,token.get('uid'))
-        if not u or not u.active or u.company_id!=c.id:
-            raise HTTPException(403,'Compte société actif requis')
+        c,u=env['resolve_company_user'](token,db)
         roles=(u.modules or {}).get('ticketRoles',[])
         if not (c.settings or {}).get('modules',{}).get('tickets'):
             raise HTTPException(403,'Module Tickets requis')
-        if u.role not in {'admin','company_admin','superuser'} and (not (u.modules or {}).get('tickets') or ((role not in roles if role!='any' else not any(r in roles for r in ('sales','dispatch','driver','boarding','reports'))) and 'manager' not in roles)):
+        if not verified_action(u) and u.role not in {'admin','company_admin','superuser'} and (not (u.modules or {}).get('tickets') or ((role not in roles if role!='any' else not any(r in roles for r in ('sales','dispatch','driver','boarding','reports'))) and 'manager' not in roles)):
             raise HTTPException(403,'Droit insuffisant')
         return c,u
 
@@ -149,7 +174,8 @@ def install(app, env):
                 raise HTTPException(422,'Chauffeur requis')
             if not ident: continue
             person=db.get(User,ident)
-            if not person or person.company_id!=cid or not person.active or not (person.modules or {}).get('tickets') or 'driver' not in (person.modules or {}).get('ticketRoles',[]):
+            if person and key=='driverId' and (person.modules or {}).get('profile')=='conductor':raise HTTPException(422,'Sélectionnez un compte chauffeur pour la conduite')
+            if not person or person.company_id!=cid or not person.active or not (person.modules or {}).get('tickets') or not (set((person.modules or {}).get('ticketRoles',[])) & ({'driver'} if key=='driverId' else {'driver','conductor'})):
                 raise HTTPException(422,'Choisissez un compte équipage actif de cette société')
         if p.get('driverId')==p.get('conductorId'):
             raise HTTPException(422,'Chauffeur et convoyeur doivent être distincts')
@@ -185,6 +211,7 @@ def install(app, env):
         if manager or 'sales' in roles:
             result['travel_packs']=rows(db,c.id,'travel_packs')
             result['parking']=rows(db,c.id,'parking')
+            result['parking_slots']=rows(db,c.id,'parking_slots')
         if manager or 'dispatch' in roles:
             result.update({k:rows(db,c.id,k) for k in ('parking','fleet_events','tracking_events','trip_shares')})
         return result
@@ -196,7 +223,8 @@ def install(app, env):
         if old:return old
         if any(p.get('status')=='Déposé' and p.get('registration','').strip().upper()==req.registration.strip().upper() for p in rows(db,c.id,'parking')):
             raise HTTPException(409,'Ce véhicule est déjà consigné')
-        item=put(db,c.id,'parking',{**req.model_dump(),'status':'Déposé','depositedAt':now().isoformat(),'createdBy':u.id,'createdByName':u.name,'agency':u.agency})
+        payload=env['check_parking_slot'](db,c,req.model_dump()) if 'check_parking_slot' in env else req.model_dump()
+        item=put(db,c.id,'parking',{**payload,'status':'Déposé','depositedAt':now().isoformat(),'createdBy':u.id,'createdByName':u.name,'agency':u.agency})
         audit(db,c,u,'Véhicule consigné',req.registration);db.commit();return item
 
     @app.post('/api/v2/operations/parking/{ident}/release')
@@ -228,6 +256,15 @@ def install(app, env):
     def crew(ident:str,req:CrewRequest,token=Depends(auth),db=Depends(session)):
         c,u=access(db,token,'dispatch',True);p=req.model_dump();crew_validate(db,c.id,p)
         tr=get(db,c.id,'ticket_trips',ident)
+        if tr.get('driverId','')==req.driverId and tr.get('conductorId','')==req.conductorId:return tr
+        from .management import interval
+        a,b=interval(tr)
+        for other in rows(db,c.id,'ticket_trips'):
+            if other['id']==ident or other.get('status')=='Annulé':continue
+            if not ({req.driverId,req.conductorId}-{''}) & {other.get('driverId'),other.get('conductorId')}:continue
+            x,y=interval(other)
+            if a<y and x<b:raise HTTPException(409,'Cet équipage est déjà affecté à un voyage sur ce créneau')
+        put(db,c.id,'staff_assignments',{'tripId':ident,'previousDriverId':tr.get('driverId',''),'previousConductorId':tr.get('conductorId',''),**p,'createdBy':u.id,'createdAt':now().isoformat()})
         result=put(db,c.id,'ticket_trips',{**tr,**p,'driver':db.get(User,req.driverId).name,'conductor':db.get(User,req.conductorId).name if req.conductorId else ''})
         audit(db,c,u,'Équipage affecté',ident);db.commit();return result
 
@@ -249,13 +286,18 @@ def install(app, env):
         c,u=access(db,token,'any',True);tr=get(db,c.id,'ticket_trips',ident)
         if u.role not in {'admin','company_admin','superuser'} and not any(r in (u.modules or {}).get('ticketRoles',[]) for r in ('manager','dispatch')) and u.id not in {tr.get('driverId'),tr.get('conductorId')}:
             raise HTTPException(403,'Vous ne faites pas partie de cet équipage')
+        if req.recordedAt:
+            recorded=legacy_trip_time(req.recordedAt)
+            if abs((now()-recorded).total_seconds())>300:raise HTTPException(422,'Position téléphone trop ancienne ou future')
         old=retry(db,c,u,'tracking_events',req.id)
         if old:return old
         if (req.latitude is None)!=(req.longitude is None) or (req.stage=='Position' and req.latitude is None):
             raise HTTPException(422,'Position GPS complète requise')
         item=put(db,c.id,'tracking_events',{**req.model_dump(),'tripId':ident,'createdAt':now().isoformat(),'createdBy':u.id})
+        if 'queue_trip_notifications' in env:
+            env['queue_trip_notifications'](db,c,u,tr,item)
         if req.stage in {'Parti','Arrivé','Embarquement'}:
-            put(db,c.id,'ticket_trips',{**tr,'status':req.stage,'actualArrivalAt':item['createdAt']} if req.stage=='Arrivé' else {**tr,'status':req.stage})
+            put(db,c.id,'ticket_trips',{**tr,'status':req.stage,'actualArrivalAt':item['createdAt']} if req.stage=='Arrivé' else {**tr,'status':req.stage,**({'actualDepartureAt':item['createdAt']} if req.stage=='Parti' else {})})
         db.commit();return item
 
     def public_data(db,token):
@@ -265,7 +307,10 @@ def install(app, env):
         if not c or not c.active:raise HTTPException(404,'Lien indisponible')
         tr=get(db,c.id,'ticket_trips',share.payload['tripId'])
         events=sorted((p for p in rows(db,c.id,'tracking_events') if p['tripId']==tr['id']),key=lambda p:p['createdAt'],reverse=True)
-        position=next((p for p in events if p.get('latitude') is not None),None)
+        from .extensions import legacy_trip_time
+        positioned=[p for p in events if p.get('latitude') is not None]
+        position=max(positioned,key=lambda p:legacy_trip_time(p.get('recordedAt') or p['createdAt'])) if positioned else None
+        if position:position={**position,'createdAt':position.get('recordedAt') or position['createdAt']}
         return {'company':c.name,'trip':{k:tr.get(k) for k in ('origin','destination','stops','departureAt','status','actualArrivalAt')},'events':[{k:p.get(k) for k in ('stage','message','createdAt')} for p in events[:50]],'position':{k:position.get(k) for k in ('latitude','longitude','accuracy','createdAt')} if position else None,'serverTime':now().isoformat()}
 
     @app.get('/api/v2/public/voyage/{token}')
@@ -277,7 +322,7 @@ def install(app, env):
         # No interpolation of personal or operational text into executable HTML.
         import json
         endpoint=json.dumps('/api/v2/public/voyage/'+token)
-        return HTMLResponse('''<!doctype html><html lang="fr"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Suivi du voyage · YamTrans</title><style>body{font:17px system-ui;background:#081b30;color:white;margin:0;padding:24px}main{max-width:850px;margin:auto}h1{font-size:36px}.card{background:#142f48;padding:22px;border-radius:18px;margin:16px 0}small{color:#b9cad9}a{color:#6ee7b7}.event{border-left:3px solid #34d399;padding:12px;margin:12px}</style><main><small>SUIVI DU VOYAGE</small><h1 id="route">Chargement…</h1><div class="card" id="status"></div><div class="card" id="position"></div><div id="events"></div></main><script>const url='''+endpoint+''';async function refresh(){try{const r=await fetch(url);if(!r.ok)throw Error('Lien indisponible');const d=await r.json();document.querySelector('#route').textContent=d.trip.origin+' → '+d.trip.destination;document.querySelector('#status').textContent=d.company+' · '+d.trip.status+' · départ '+new Date(d.trip.departureAt).toLocaleString('fr-FR');const box=document.querySelector('#position');box.replaceChildren();if(d.position){const p=d.position,age=Date.now()-Date.parse(p.createdAt);box.append((age>300000?'Position ancienne · ':'Dernière position · ')+new Date(p.createdAt).toLocaleString('fr-FR')+' ');const a=document.createElement('a');a.href='https://www.openstreetmap.org/?mlat='+p.latitude+'&mlon='+p.longitude+'#map=13/'+p.latitude+'/'+p.longitude;a.textContent='Voir sur la carte';a.target='_blank';a.rel='noopener';box.append(a)}else box.textContent='Position non transmise par l’équipage';const host=document.querySelector('#events');host.replaceChildren();for(const e of d.events){const div=document.createElement('div');div.className='event';div.textContent=e.stage+' · '+e.message+' · '+new Date(e.createdAt).toLocaleString('fr-FR');host.append(div)}}catch(e){document.querySelector('#status').textContent='Suivi indisponible. Les informations affichées peuvent être anciennes.'}}refresh();setInterval(refresh,30000)</script></html>''')
+        return HTMLResponse('''<!doctype html><html lang="fr"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Suivi du voyage · YamTrans</title><style>body{font:17px system-ui;background:#081b30;color:white;margin:0;padding:24px}main{max-width:850px;margin:auto}h1{font-size:36px}.card{background:#142f48;padding:22px;border-radius:18px;margin:16px 0}small{color:#b9cad9}a{color:#6ee7b7}.event{border-left:3px solid #34d399;padding:12px;margin:12px}</style><main><small>SUIVI DU VOYAGE</small><h1 id="route">Chargement…</h1><div class="card" id="status"></div><div class="card" id="position"></div><div id="events"></div></main><script>const url='''+endpoint+''';async function refresh(){try{const r=await fetch(url);if(!r.ok)throw Error('Lien indisponible');const d=await r.json();document.querySelector('#route').textContent=d.trip.origin+' → '+d.trip.destination;document.querySelector('#status').textContent=d.company+' · '+d.trip.status+' · départ '+new Date(d.trip.departureAt).toLocaleString('fr-FR');const box=document.querySelector('#position');box.replaceChildren();if(d.position){const p=d.position,age=Date.now()-Date.parse(p.createdAt);box.append((age>300000?'Position ancienne · ':'Dernière position · ')+new Date(p.createdAt).toLocaleString('fr-FR')+' ');const a=document.createElement('a');a.href='https://www.openstreetmap.org/?mlat='+p.latitude+'&mlon='+p.longitude+'#map=13/'+p.latitude+'/'+p.longitude;a.textContent='Ouvrir la carte';a.target='_blank';a.rel='noopener';box.append(a);const frame=document.createElement('iframe'),lat=Math.max(-85,Math.min(85,p.latitude)),lon=p.longitude,bbox=[Math.max(-180,lon-.025),Math.max(-85,lat-.018),Math.min(180,lon+.025),Math.min(85,lat+.018)].join(',');frame.src='https://www.openstreetmap.org/export/embed.html?bbox='+encodeURIComponent(bbox)+'&layer=mapnik&marker='+encodeURIComponent(p.latitude+','+p.longitude);frame.title='Position du véhicule';frame.referrerPolicy='no-referrer';frame.style.cssText='width:100%;height:320px;border:0;border-radius:14px;margin-top:16px';box.append(frame)}else box.textContent='Position non transmise par l’équipage';const host=document.querySelector('#events');host.replaceChildren();for(const e of d.events){const div=document.createElement('div');div.className='event';div.textContent=e.stage+' · '+e.message+' · '+new Date(e.createdAt).toLocaleString('fr-FR');host.append(div)}}catch(e){document.querySelector('#status').textContent='Suivi indisponible. Les informations affichées peuvent être anciennes.'}}refresh();setInterval(refresh,30000)</script></html>''')
 
     @app.post('/api/v2/operations/documents/ocr')
     def ocr(req:OcrRequest,token=Depends(auth),db=Depends(session)):
@@ -296,7 +341,9 @@ def install(app, env):
         if req.photo:
             from .identity_ocr import decode_image
             decode_image(req.photo)
-        number=''.join(req.number.upper().split())
+        number=validate_document_number(req.kind, req.number)
+        if req.kind in {'CNIB','Passeport'} and not req.photo:
+            raise HTTPException(422, 'Photographiez la pièce avant de l’enregistrer')
         if req.expiresOn and date(req.expiresOn)<now().date():raise HTTPException(422,'La pièce est déjà expirée')
         matches=[p for p in rows(db,c.id,'customer_documents') if p['number']==number and p.get('active')]
         if matches:raise HTTPException(409,'Cette pièce est déjà enregistrée')
@@ -313,13 +360,16 @@ def install(app, env):
             put(db,c.id,'customer_documents',{**previous,'active':False,'replacedBy':req.id})
             customer=next((p for p in rows(db,c.id,'ticket_customers') if p['id']==customer_id),{'id':customer_id,'points':0})
             put(db,c.id,'ticket_customers',{**customer,'name':req.customerName,'phone':req.phone})
+        if req.birthDate:
+            customer=next((p for p in rows(db,c.id,'ticket_customers') if p['id']==customer_id),{'id':customer_id,'points':0})
+            put(db,c.id,'ticket_customers',{**customer,'birthDate':req.birthDate})
         item=put(db,c.id,'customer_documents',{**req.model_dump(),'customerId':customer_id,'replacesId':previous['id'] if previous else '', 'number':number,'active':True,'createdBy':u.id,'createdAt':now().isoformat()})
         audit(db,c,u,'Pièce client enregistrée',customer_id);db.commit();return {'id':item['id'],'customerId':item['customerId']}
 
     @app.get('/api/v2/operations/documents/lookup')
     def lookup(number:str,token=Depends(auth),db=Depends(session)):
         c,u=access(db,token,'boarding')
-        number=''.join(number.upper().split())
+        number=''.join(number.upper().split()).replace('-','')
         p=next((p for p in rows(db,c.id,'customer_documents') if p['number']==number and p.get('active')),None)
         if not p:raise HTTPException(404,'Pièce non reconnue')
         if p.get('expiresOn') and date(p['expiresOn'])<now().date():raise HTTPException(409,'Pièce expirée : renouvellement requis')
@@ -407,7 +457,7 @@ def install(app, env):
         rest_hours=float((c.settings or {}).get('crewRestHours',10));weekly_limit=float((c.settings or {}).get('crewWeeklyTrips',8))
         week=now()-timedelta(days=7)
         for person in db.scalars(select(User).where(User.company_id==c.id,User.active.is_(True))).all():
-            if 'driver' not in (person.modules or {}).get('ticketRoles',[]):continue
+            if not set((person.modules or {}).get('ticketRoles',[])) & {'driver','conductor'}:continue
             assigned=sorted([t for t in trips if person.id in {t.get('driverId'),t.get('conductorId')}],key=lambda t:t['departureAt'])
             recent=[t for t in assigned if week.isoformat()<=t['departureAt']<=now().isoformat()]
             alerts=[]
