@@ -84,3 +84,71 @@ def test_staff_can_review_and_verify_without_exposing_account_secrets(setup,paym
     verified=client.post('/api/v2/passenger-admin/orders/client-order-0000001/verify',headers=setup[0])
     assert verified.status_code==200,verified.text
     assert verified.json()['ticket']['paid']==5000
+
+
+def test_profile_travellers_favourites_and_password_sessions(setup):
+    h=register();other=register('other@example.com')
+    update=client.put('/api/v2/passenger/me',headers=h,json={'name':'Nouveau Nom','phone':'70000002'})
+    assert update.status_code==200 and update.json()['name']=='Nouveau Nom'
+    body={'id':'traveller-one','name':'Famille Test','phone':'70000003','birthDate':'2002-03-25'}
+    assert client.put('/api/v2/passenger/travellers/traveller-one',headers=h,json=body).status_code==200
+    assert client.get('/api/v2/passenger/travellers',headers=other).json()['travellers']==[]
+    assert client.put('/api/v2/passenger/travellers/traveller-one',headers=h,json={**body,'birthDate':'2100-01-01'}).status_code==422
+    assert client.post('/api/v2/passenger/favourites',headers=h,json={'origin':' OUAGA ','destination':'BOBO'}).json()['favourites']==[{'origin':'Ouaga','destination':'Bobo'}]
+    assert client.get('/api/v2/passenger/favourites',headers=other).json()['favourites']==[]
+    assert client.post('/api/v2/passenger/favourites',headers=h,json={'origin':'Paris','destination':'Bobo'}).status_code==422
+    second=client.post('/api/v2/passenger/login',json={'email':'client@example.com','password':'Strong-pass-123'}).json()['token']
+    r=client.post('/api/v2/passenger/password',headers=h,json={'currentPassword':'Strong-pass-123','newPassword':'New-password-456'})
+    assert r.status_code==200
+    assert client.get('/api/v2/passenger/me',headers={'Authorization':'Bearer '+second}).status_code==401
+    assert client.get('/api/v2/passenger/me',headers=h).status_code==200
+    assert client.post('/api/v2/passenger/login',json={'email':'client@example.com','password':'New-password-456'}).status_code==200
+    assert client.delete('/api/v2/passenger/travellers/traveller-one',headers=h).json()['travellers']==[]
+
+
+def test_service_requests_ownership_and_staff_response(setup,payment):
+    h=register();other=register('other@example.com');client.post('/api/v2/passenger/orders',headers=h,json=booking())
+    body={'id':'request-client-00001','kind':'Modification','orderId':'client-order-0000001','message':'Je souhaite changer le jour de mon voyage.'}
+    assert client.post('/api/v2/passenger/requests',headers=other,json=body).status_code==404
+    for _ in range(2):assert client.post('/api/v2/passenger/requests',headers=h,json=body).status_code==200
+    assert len(client.get('/api/v2/passenger/requests',headers=h).json()['requests'])==1
+    assert client.get('/api/v2/passenger/requests',headers=other).json()['requests']==[]
+    assert client.put('/api/v2/passenger-admin/requests/request-client-00001',headers=h,json={'status':'Clôturée','reply':'accord'}).status_code==401
+    r=client.put('/api/v2/passenger-admin/requests/request-client-00001',headers=setup[0],json={'status':'En traitement','reply':'Nous vérifions la disponibilité du prochain départ.'})
+    assert r.status_code==200,r.text
+    assert 'Nous vérifions' in client.get('/api/v2/passenger/requests',headers=h).json()['requests'][0]['reply']
+    assert client.get('/api/v2/passenger/orders',headers=h).json()['orders'][0]['status']=='En attente du paiement'
+
+
+def test_public_config_search_and_tracking_do_not_leak_private_data(setup):
+    cfg=client.get('/api/v2/passenger/config');assert cfg.status_code==200,cfg.text
+    assert cfg.json()['version']=='1.1.0'
+    assert cfg.json()['routes'][0]['fare']==5000
+    day=setup[2][:10]
+    search=client.get('/api/v2/passenger/trips',params={'origin':'ouaga','destination':'bobo','date':day,'category':'adult'})
+    assert search.status_code==200 and search.json()['trips'][0]['stops']==['Ouaga','Boromo','Bobo']
+    with m.SessionLocal() as db:
+        db.add(m.ShipmentIndexV3(company_id=setup[1],code='OUA-00001',entity_id='one',public_payload={'code':'OUA-00001','status':'En route','origin':'Ouaga','destination':'Bobo','senderPhone':'secret','receiverName':'private'},updated_at=m.utcnow()));db.commit()
+    tracking=client.get('/api/v2/passenger/shipments/OUA-00001')
+    assert tracking.status_code==200 and tracking.json()['status']=='En route'
+    assert 'secret' not in tracking.text and 'private' not in tracking.text
+
+
+def test_tracking_link_only_when_company_enabled_share(setup,payment):
+    h=register();client.post('/api/v2/passenger/orders',headers=h,json=booking());client.post('/api/v2/passenger/orders/client-order-0000001/verify',headers=h)
+    assert 'trackingUrl' not in client.get('/api/v2/passenger/orders',headers=h).json()['orders'][0]
+    with m.SessionLocal() as db:
+        db.add(m.EntityV3(company_id=setup[1],entity_type='trip_shares',entity_id='share',payload={'id':'share','tripId':'trip','token':'test-token','active':True},version=1,updated_at=m.utcnow(),deleted=False));db.commit()
+    assert client.get('/api/v2/passenger/orders',headers=h).json()['orders'][0]['trackingUrl'].endswith('/voyage/test-token')
+    with m.SessionLocal() as db:
+        r=db.get(m.EntityV3,{'company_id':setup[1],'entity_type':'trip_shares','entity_id':'share'});r.payload={**r.payload,'active':False};db.commit()
+    assert 'trackingUrl' not in client.get('/api/v2/passenger/orders',headers=h).json()['orders'][0]
+
+
+def test_disabled_ticket_module_still_allows_profile_but_blocks_new_sales(setup,payment):
+    with m.SessionLocal() as db:
+        c=db.get(m.Company,setup[1]);c.settings={**c.settings,'modules':{'courier':True,'tickets':False}};db.commit()
+    h=register()
+    assert client.get('/api/v2/passenger/me',headers=h).status_code==200
+    assert client.get('/api/v2/passenger/config').json()['routes']==[]
+    assert client.post('/api/v2/passenger/orders',headers=h,json=booking()).status_code==503

@@ -8,6 +8,8 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from fastapi import Depends, Header, HTTPException
 from pydantic import BaseModel, Field
+from typing import Literal
+from urllib.parse import urlsplit
 from sqlalchemy import select
 from . import yengapay
 from .journey import journey_stops, canonical_segment
@@ -29,6 +31,35 @@ class Booking(BaseModel):
     phone:str=Field(min_length=8,max_length=30)
     passengerCategory:str=Field(default='adult',pattern='^(adult|child)$')
 
+
+class Traveller(BaseModel):
+    id:str=Field(pattern=r'^[a-zA-Z0-9-]{8,80}$')
+    name:str=Field(min_length=2,max_length=120)
+    phone:str=Field(default='',max_length=30)
+    birthDate:str=Field(default='',max_length=10)
+
+class ProfileEdit(BaseModel):
+    name:str=Field(min_length=2,max_length=120)
+    phone:str=Field(min_length=8,max_length=30)
+
+class PasswordEdit(BaseModel):
+    currentPassword:str=Field(min_length=10,max_length=200)
+    newPassword:str=Field(min_length=10,max_length=200)
+
+class Favourite(BaseModel):
+    origin:str=Field(min_length=1,max_length=160)
+    destination:str=Field(min_length=1,max_length=160)
+
+class ServiceRequest(BaseModel):
+    id:str=Field(pattern=r'^[a-zA-Z0-9-]{16,80}$')
+    orderId:str=Field(default='',max_length=80)
+    kind:Literal['Modification','Annulation / remboursement','Bagages','Assistance','Autre']
+    message:str=Field(min_length=8,max_length=1500)
+
+class RequestReply(BaseModel):
+    status:Literal['Reçue','En traitement','Clôturée']
+    reply:str=Field(min_length=3,max_length=1500)
+
 def install(app,env):
     Entity,Company=env['EntityV3'],env['Company']; session=env['db_session']; now=env['utcnow']
     def rows(db,cid,kind):
@@ -45,7 +76,7 @@ def install(app,env):
         db.flush();return item
     def company(db,write=False):
         c=db.scalar(select(Company).where(Company.code==os.getenv('PASSENGER_COMPANY_CODE',env['DEFAULT_COMPANY_CODE']).upper()))
-        if not c or not c.active or not (c.settings or {}).get('modules',{}).get('tickets'):raise HTTPException(503,'La réservation en ligne est indisponible pour le moment')
+        if not c or not c.active:raise HTTPException(503,'Le service de la compagnie est indisponible pour le moment')
         if write:lock_company(db,Company,c.id)
         return c
     def profile(a):return {k:a.get(k,'') for k in ('id','name','email','phone')}
@@ -61,14 +92,21 @@ def install(app,env):
         put(db,c.id,'passenger_sessions',{'id':hashlib.sha256(token.encode()).hexdigest(),'accountId':a['id'],'expiresAt':(now()+timedelta(days=30)).isoformat()})
         db.commit();return {'token':token,'profile':profile(a)}
     def public_order(db,c,o):
-        safe={k:o.get(k) for k in ('id','amount','status','tripId','seat','boardingPoint','dropPoint','departureAt','passengerName','phone','expiresAt','checkoutUrl','message')}
+        safe={k:o.get(k) for k in ('id','amount','status','tripId','seat','boardingPoint','dropPoint','departureAt','passengerName','phone','expiresAt','checkoutUrl','message','passengerCategory','createdAt')}
         if o.get('ticketId'):
             t=get(db,c.id,'tickets',o['ticketId']);safe['ticket']={k:t.get(k) for k in ('id','pnr','passengerName','phone','seat','seatClass','boardingPoint','dropPoint','departureAt','fare','paid','status','boarded','busLabel')}
+        tr=next((t for t in rows(db,c.id,'ticket_trips') if t['id']==o['tripId']),{})
+        safe['tripStatus']=tr.get('status','')
+        safe['stops']=safe_stops(tr)
+        share=next((share for share in rows(db,c.id,'trip_shares') if share.get('active') and share.get('tripId')==o['tripId']),None)
+        if share and o.get('ticketId') and safe['ticket'].get('status') not in {'Annulé','Remboursé'}:
+            safe['trackingUrl']=env['PUBLIC_BASE_URL']+'/voyage/'+share['token']
         return safe
     def departure(tr):
         try:d=datetime.fromisoformat(str(tr['departureAt']).replace('Z','+00:00'));return d.replace(tzinfo=timezone.utc) if d.tzinfo is None else d
         except (ValueError,KeyError):raise HTTPException(422,'Date du départ à vérifier') from None
     def quote_trip(db,c,tr,segment):
+        if not (c.settings or {}).get('modules',{}).get('tickets'):raise HTTPException(503,'La compagnie n’a pas encore ouvert la réservation de billets')
         if tr.get('status') not in {'Publié','Planifié','Opérations','Ouvert à la vente','Embarquement'} or departure(tr)<=now():raise HTTPException(409,'Ce départ est fermé à la réservation')
         bus=get(db,c.id,'ticket_buses',str(tr.get('busId','')))
         if bus.get('active') is False or bus.get('status') in {'Maintenance','En panne','Indisponible','Hors service'}:raise HTTPException(409,'Véhicule indisponible')
@@ -78,26 +116,40 @@ def install(app,env):
         for s in bus_seats(bus):
             fare=route_fare(route,tr,segment,s['class'])
             valid=fare is not None and fare>=100 and fare==int(fare)
-            seats.append({'label':str(s['label']),'class':s['class'],'fare':int(fare) if valid else None,'available':valid and not any(str(x.get('seat'))==str(s['label']) and overlap(tr,segment,x) for x in allocated)})
-        return {'id':tr['id'],**segment,'departureAt':tr['departureAt'],'bus':bus.get('name',''),'seats':seats,'available':sum(s['available'] for s in seats)}
+            seats.append({'label':str(s['label']),'class':s['class'],'row':s.get('row'),'col':s.get('col'),'fare':int(fare) if valid else None,'available':valid and not any(str(x.get('seat'))==str(s['label']) and overlap(tr,segment,x) for x in allocated)})
+        return {'id':tr['id'],**segment,'departureAt':tr['departureAt'],'bus':bus.get('name',''),'stops':journey_stops(tr),'registration':bus.get('registration',''),'seats':seats,'available':sum(s['available'] for s in seats)}
 
     @app.get('/api/v2/passenger/config')
     def config(db=Depends(session)):
         c=company(db);cities={s for t in rows(db,c.id,'ticket_trips') for s in safe_stops(t)}
-        return {'company':c.name,'phone':c.phone,'cities':sorted(cities),'paymentEnabled':yengapay.configured(),'currency':'XOF'}
+        routes={}
+        for tr in rows(db,c.id,'ticket_trips'):
+            try:
+                q=quote_trip(db,c,tr,canonical_segment(tr,{}));prices=[seat['fare'] for seat in q['seats'] if seat['available'] and seat['fare'] is not None]
+                if not prices:continue
+                key=(q['boardingPoint'],q['dropPoint']);r=routes.setdefault(key,{'origin':key[0],'destination':key[1],'fare':min(prices),'departures':0})
+                r['fare']=min(r['fare'],min(prices));r['departures']+=1
+            except HTTPException:continue
+        agencies=[]
+        for agency in rows(db,c.id,'agencies'):
+            if agency.get('active') is False:continue
+            out=env['agency_public_info'](db,c.id,agency.get('name',''))
+            phone=str(agency.get('phone') or c.phone or '')
+            agencies.append({k:out.get(k,'') for k in ('name','city','address','pickupDirections','mapsUrl')}|{'id':agency['id'],'phone':phone})
+        return {'version':'1.1.0','company':c.name,'phone':c.phone,'cities':sorted(cities),'routes':list(routes.values())[:12],'agencies':agencies,'paymentEnabled':yengapay.configured(),'currency':'XOF'}
     def safe_stops(tr):
         try:return journey_stops(tr)
         except HTTPException:return []
 
     @app.get('/api/v2/passenger/trips')
-    def search(origin:str,destination:str,date:str,db=Depends(session)):
+    def search(origin:str,destination:str,date:str,category:Literal['adult','child']='adult',db=Depends(session)):
         c=company(db)
         try:datetime.strptime(date,'%Y-%m-%d')
         except ValueError:raise HTTPException(422,'Date invalide') from None
         result=[]
         for tr in rows(db,c.id,'ticket_trips'):
             if not str(tr.get('departureAt','')).startswith(date):continue
-            try:result.append(quote_trip(db,c,tr,canonical_segment(tr,{'boardingPoint':origin,'dropPoint':destination})))
+            try:result.append(quote_trip(db,c,tr,{**canonical_segment(tr,{'boardingPoint':origin,'dropPoint':destination}),'passengerCategory':category}))
             except HTTPException:continue
         return {'trips':sorted(result,key=lambda t:t['departureAt'])[:100]}
 
@@ -202,3 +254,96 @@ def install(app,env):
     def staff_verify(order_id:str,token=Depends(env['read_token']),db=Depends(session)):
         c,u=staff_access(db,token,True);o=get(db,c.id,'passenger_orders',order_id);a=get(db,c.id,'passenger_accounts',o['accountId'])
         return verify_order(db,c,a,o)
+
+    def valid_birthdate(value):
+        if not value:return ''
+        try:d=datetime.strptime(value,'%Y-%m-%d').date()
+        except ValueError:raise HTTPException(422,'Date de naissance invalide') from None
+        if d>now().date() or d.year<1900:raise HTTPException(422,'Date de naissance invalide')
+        return value
+
+    @app.put('/api/v2/passenger/me')
+    def edit_profile(req:ProfileEdit,authorization:str=Header(default=''),db=Depends(session)):
+        c=company(db,True);a=account(db,c,authorization)
+        a=put(db,c.id,'passenger_accounts',{**a,'name':req.name.strip(),'phone':req.phone.strip()});db.commit();return profile(a)
+
+    @app.post('/api/v2/passenger/password')
+    def edit_password(req:PasswordEdit,authorization:str=Header(default=''),db=Depends(session)):
+        c=company(db,True);a=account(db,c,authorization)
+        digest=hashlib.pbkdf2_hmac('sha256',req.currentPassword.encode(),a['salt'].encode(),210000).hex()
+        if not hmac.compare_digest(digest,a['passwordHash']):raise HTTPException(403,'Mot de passe actuel incorrect')
+        salt=secrets.token_hex(16);put(db,c.id,'passenger_accounts',{**a,'salt':salt,'passwordHash':hashlib.pbkdf2_hmac('sha256',req.newPassword.encode(),salt.encode(),210000).hex()})
+        current=hashlib.sha256(authorization.removeprefix('Bearer ').encode()).hexdigest()
+        for sess in rows(db,c.id,'passenger_sessions'):
+            if sess['accountId']==a['id'] and sess['id']!=current:put(db,c.id,'passenger_sessions',{**sess,'revoked':True})
+        db.commit();return {'ok':True}
+
+    @app.get('/api/v2/passenger/travellers')
+    def travellers(authorization:str=Header(default=''),db=Depends(session)):
+        c=company(db);a=account(db,c,authorization)
+        return {'travellers':a.get('travellers',[])}
+
+    @app.put('/api/v2/passenger/travellers/{traveller_id}')
+    def save_traveller(traveller_id:str,req:Traveller,authorization:str=Header(default=''),db=Depends(session)):
+        c=company(db,True);a=account(db,c,authorization)
+        if req.id!=traveller_id:raise HTTPException(422,'Référence du voyageur invalide')
+        item=req.model_dump();item['birthDate']=valid_birthdate(item['birthDate']);items=[x for x in a.get('travellers',[]) if x['id']!=req.id]
+        if len(items)>=12:raise HTTPException(422,'Douze voyageurs maximum par compte')
+        items.append(item);put(db,c.id,'passenger_accounts',{**a,'travellers':items});db.commit();return {'travellers':items}
+
+    @app.delete('/api/v2/passenger/travellers/{traveller_id}')
+    def delete_traveller(traveller_id:str,authorization:str=Header(default=''),db=Depends(session)):
+        c=company(db,True);a=account(db,c,authorization);items=[x for x in a.get('travellers',[]) if x['id']!=traveller_id]
+        put(db,c.id,'passenger_accounts',{**a,'travellers':items});db.commit();return {'travellers':items}
+
+    @app.get('/api/v2/passenger/favourites')
+    def favourites(authorization:str=Header(default=''),db=Depends(session)):
+        c=company(db);a=account(db,c,authorization);return {'favourites':a.get('favourites',[])}
+
+    @app.post('/api/v2/passenger/favourites')
+    def favourite(req:Favourite,authorization:str=Header(default=''),db=Depends(session)):
+        c=company(db,True);a=account(db,c,authorization);segment=None
+        for tr in rows(db,c.id,'ticket_trips'):
+            try:segment=canonical_segment(tr,{'boardingPoint':req.origin,'dropPoint':req.destination});break
+            except HTTPException:continue
+        if not segment:raise HTTPException(422,'Cette ligne ne fait pas partie du réseau')
+        item={'origin':segment['boardingPoint'],'destination':segment['dropPoint']};items=a.get('favourites',[])
+        items=[x for x in items if x!=item] if item in items else [*items,item]
+        if len(items)>20:raise HTTPException(422,'Vingt trajets favoris maximum')
+        put(db,c.id,'passenger_accounts',{**a,'favourites':items});db.commit();return {'favourites':items}
+
+    @app.get('/api/v2/passenger/requests')
+    def requests(authorization:str=Header(default=''),db=Depends(session)):
+        c=company(db);a=account(db,c,authorization)
+        return {'requests':[r for r in rows(db,c.id,'passenger_requests') if r['accountId']==a['id']]}
+
+    @app.post('/api/v2/passenger/requests')
+    def service_request(req:ServiceRequest,authorization:str=Header(default=''),db=Depends(session)):
+        c=company(db,True);a=account(db,c,authorization)
+        if req.orderId:
+            o=get(db,c.id,'passenger_orders',req.orderId)
+            if o['accountId']!=a['id']:raise HTTPException(404,'Commande introuvable')
+        existing=next((r for r in rows(db,c.id,'passenger_requests') if r['id']==req.id),None)
+        if existing:
+            if existing['accountId']!=a['id']:raise HTTPException(404,'Demande introuvable')
+            return existing
+        if sum(r['accountId']==a['id'] and r['status']!='Clôturée' for r in rows(db,c.id,'passenger_requests'))>=10:raise HTTPException(429,'Vous avez déjà dix demandes en cours')
+        item=put(db,c.id,'passenger_requests',{**req.model_dump(),'accountId':a['id'],'passengerName':a['name'],'phone':a.get('phone',''),'status':'Reçue','createdAt':now().isoformat(),'reply':''});db.commit();return item
+
+    @app.get('/api/v2/passenger-admin/requests')
+    def staff_requests(token=Depends(env['read_token']),db=Depends(session)):
+        c,u=staff_access(db,token);return {'requests':sorted(rows(db,c.id,'passenger_requests'),key=lambda r:r['createdAt'],reverse=True)[:200]}
+
+    @app.put('/api/v2/passenger-admin/requests/{request_id}')
+    def staff_reply(request_id:str,req:RequestReply,token=Depends(env['read_token']),db=Depends(session)):
+        c,u=staff_access(db,token,True);lock_company(db,Company,c.id);r=get(db,c.id,'passenger_requests',request_id)
+        r=put(db,c.id,'passenger_requests',{**r,**req.model_dump(),'repliedAt':now().isoformat()});db.commit();return r
+
+    @app.get('/api/v2/passenger/shipments/{code}')
+    def shipment_status(code:str,db=Depends(session)):
+        c=company(db)
+        if len(code)>120:raise HTTPException(422,'Référence invalide')
+        idx=db.get(env['ShipmentIndexV3'],{'company_id':c.id,'code':code.strip().upper()})
+        if not idx:raise HTTPException(404,'Envoi introuvable. Vérifiez la référence sur votre reçu.')
+        source=idx.public_payload or {}
+        return {k:source.get(k,'') for k in ('code','status','origin','destination','createdAt','updatedAt')}
